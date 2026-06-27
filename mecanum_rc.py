@@ -293,7 +293,7 @@ DASHBOARD_HTML = r"""
 <script>
 const names=["FL","FR","RL","RR"];
 const corners={FL:"前左",FR:"前右",RL:"後左",RR:"後右"};
-const displaySign={FL:1,FR:-1,RL:1,RR:-1};
+const displaySign={FL:-1,FR:1,RL:-1,RR:1};
 const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):"--";
 const cls=(ok)=>ok?"status-ok":"status-warn";
 function kv(id, rows){document.getElementById(id).innerHTML=rows.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("");}
