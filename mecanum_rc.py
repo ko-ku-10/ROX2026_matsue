@@ -118,7 +118,7 @@ TRANSLATION_GAIN = float(os.getenv("TRANSLATION_GAIN", "1.0"))
 ROTATION_GAIN = float(os.getenv("ROTATION_GAIN", "1.0"))
 INPUT_CURVE_EXPONENT = float(os.getenv("INPUT_CURVE_EXPONENT", "1.0"))
 # 1秒あたりに変化できる最大量（0で無効）
-INPUT_SLEW_RATE = float(os.getenv("INPUT_SLEW_RATE", "0.0"))
+INPUT_SLEW_RATE = float(os.getenv("INPUT_SLEW_RATE", "1.2"))
 # ニュートラル近傍は0指令へ吸着（方向反転のチャタリング抑制）
 MOTOR_ZERO_HOLD_BAND = float(os.getenv("MOTOR_ZERO_HOLD_BAND", "0.06"))
 MOTOR_ZERO_HOLD_BAND = max(0.0, min(1.0, MOTOR_ZERO_HOLD_BAND))
@@ -172,6 +172,10 @@ EDULITE05_ENCODER_WRAP_RADIANS = _env_flag("EDULITE05_ENCODER_WRAP_RADIANS", "1"
 EDULITE05_ENCODER_FRAME = os.getenv("EDULITE05_ENCODER_FRAME", "status").strip().lower()
 EDULITE05_ENCODER_SPEED_FILTER_ALPHA = max(0.0, min(1.0, float(os.getenv("EDULITE05_ENCODER_SPEED_FILTER_ALPHA", "0.25"))))
 PID_CORRECTION_DEADBAND = max(0.0, min(1.0, float(os.getenv("PID_CORRECTION_DEADBAND", "0.12"))))
+WHEEL_COMMAND_SLEW_RATE = max(0.0, float(os.getenv("WHEEL_COMMAND_SLEW_RATE", "1.5")))
+SLIP_GUARD_ENABLE = _env_flag("SLIP_GUARD_ENABLE", "1")
+SLIP_SPEED_ERROR_THRESHOLD = max(0.0, min(1.0, float(os.getenv("SLIP_SPEED_ERROR_THRESHOLD", "0.35"))))
+SLIP_COMMAND_SCALE = max(0.0, min(1.0, float(os.getenv("SLIP_COMMAND_SCALE", "0.75"))))
 
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
@@ -740,6 +744,9 @@ class MecanumDrive:
             self.feedback = EDULITE05EncoderFeedback(bus, MOTOR_ID)
         else:
             self.feedback = None
+        self._last_wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
+        self._last_wheel_target_at = time.monotonic()
+        self._slip_guard_active = False
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -791,6 +798,7 @@ class MecanumDrive:
             "RL": rl_out,
             "RR": rr_out,
         }
+        wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
         feedback_values = None
         if PID_ENABLE:
             wheel_targets, feedback_values = self._apply_pid(wheel_targets)
@@ -806,12 +814,15 @@ class MecanumDrive:
                 self._last_debug_at = now
                 pid_text = ""
                 if PID_ENABLE and feedback_values is not None:
+                    slip_text = " slip_guard=ON" if self._slip_guard_active else ""
+                    self._slip_guard_active = False
                     pid_text = (
                         " | PID measured "
                         f"FL={feedback_values.get('FL', 0.0):+.2f} "
                         f"FR={feedback_values.get('FR', 0.0):+.2f} "
                         f"RL={feedback_values.get('RL', 0.0):+.2f} "
                         f"RR={feedback_values.get('RR', 0.0):+.2f}"
+                        f"{slip_text}"
                     )
                 print(
                     "[DEBUG] "
@@ -820,6 +831,29 @@ class MecanumDrive:
                     f"RL={wheel_targets['RL']:+.2f} RR={wheel_targets['RR']:+.2f}"
                     f"{pid_text}"
                 )
+
+    def _apply_wheel_slew_limit(self, targets: dict[str, float]) -> dict[str, float]:
+        if WHEEL_COMMAND_SLEW_RATE <= 0.0:
+            self._last_wheel_targets = dict(targets)
+            self._last_wheel_target_at = time.monotonic()
+            return targets
+
+        now = time.monotonic()
+        dt = max(0.001, now - self._last_wheel_target_at)
+        self._last_wheel_target_at = now
+        max_delta = WHEEL_COMMAND_SLEW_RATE * dt
+        limited: dict[str, float] = {}
+        for name in WHEEL_NAMES:
+            previous = self._last_wheel_targets.get(name, 0.0)
+            target = targets[name]
+            delta = target - previous
+            if delta > max_delta:
+                target = previous + max_delta
+            elif delta < -max_delta:
+                target = previous - max_delta
+            limited[name] = _clamp(target)
+        self._last_wheel_targets = dict(limited)
+        return limited
 
     def _apply_pid(self, targets: dict[str, float]) -> tuple[dict[str, float], dict[str, float] | None]:
         if self.feedback is None:
@@ -859,6 +893,10 @@ class MecanumDrive:
                 continue
 
             correction = pid.update(target, measured, dt)
+            if SLIP_GUARD_ENABLE and abs(measured - target) > SLIP_SPEED_ERROR_THRESHOLD:
+                self._slip_guard_active = True
+                correction *= SLIP_COMMAND_SCALE
+                target *= SLIP_COMMAND_SCALE
             adjusted[name] = _clamp(target + correction)
 
         return adjusted, feedback_values
@@ -1512,7 +1550,8 @@ def main() -> None:
         f"translation_gain={TRANSLATION_GAIN:.2f} "
         f"rotation_gain={ROTATION_GAIN:.2f} "
         f"curve_exp={INPUT_CURVE_EXPONENT:.2f} "
-        f"slew_rate={INPUT_SLEW_RATE:.2f} "
+        f"input_slew={INPUT_SLEW_RATE:.2f} "
+        f"wheel_slew={WHEEL_COMMAND_SLEW_RATE:.2f} "
         f"min_send={MOTOR_MIN_SEND_INTERVAL:.3f}s "
         f"zero_hold={MOTOR_ZERO_HOLD_BAND:.2f}"
     )
@@ -1522,6 +1561,7 @@ def main() -> None:
         f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
         f"limit={PID_OUTPUT_LIMIT:.2f} "
         f"corr_deadband={PID_CORRECTION_DEADBAND:.2f} "
+        f"slip_guard={'ON' if SLIP_GUARD_ENABLE else 'OFF'} "
         f"source={PID_FEEDBACK_SOURCE} "
         f"encoder_frame={EDULITE05_ENCODER_FRAME} "
         f"encoder_format={EDULITE05_ENCODER_FORMAT}"
