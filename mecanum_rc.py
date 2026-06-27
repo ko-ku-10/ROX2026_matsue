@@ -144,10 +144,10 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 DEBUG_INPUT = _env_flag("DEBUG_INPUT", "1")
-DEBUG_ENCODER = _env_flag("DEBUG_ENCODER", "0")
+DEBUG_ENCODER = _env_flag("DEBUG_ENCODER", "1")
 
 # PID速度制御（フィードバック速度が取れる場合のみ有効化する）
-PID_ENABLE = _env_flag("PID_ENABLE", "0")
+PID_ENABLE = _env_flag("PID_ENABLE", "1")
 PID_KP = float(os.getenv("PID_KP", "0.35"))
 PID_KI = float(os.getenv("PID_KI", "0.0"))
 PID_KD = float(os.getenv("PID_KD", "0.0"))
@@ -378,6 +378,17 @@ class EDULITE05EncoderFeedback:
             if EDULITE05_ENCODER_STALE_SEC <= 0.0
             or now - self._speed_updated_at.get(name, 0.0) <= EDULITE05_ENCODER_STALE_SEC
         }
+        if DEBUG_ENCODER and fresh and now - self._last_debug_at >= 0.5:
+            self._last_debug_at = now
+            value_text = " ".join(
+                f"{name}={self._last_value.get(name, 0.0):+.0f}"
+                for name in WHEEL_NAMES
+            )
+            speed_text = " ".join(
+                f"{name}={fresh.get(name, 0.0):+.3f}"
+                for name in WHEEL_NAMES
+            )
+            print(f"[ENCODER] value {value_text} | speed {speed_text}")
         return fresh or None
 
     def _query_if_needed(self, now: float) -> None:
@@ -412,14 +423,6 @@ class EDULITE05EncoderFeedback:
             return
         self._speeds[name] = self._encoder_delta_to_speed(encoder_value - last_value, dt)
         self._speed_updated_at[name] = now
-        if DEBUG_ENCODER and now - self._last_debug_at >= 0.5:
-            self._last_debug_at = now
-            print(
-                "[ENCODER] "
-                f"{name} value={encoder_value:+.4f} "
-                f"delta={encoder_value - last_value:+.4f} "
-                f"dt={dt:.3f}s speed={self._speeds[name]:+.3f}"
-            )
 
     def _motor_name(self, frame_type: int, can_id: int, motor_addr: int) -> str | None:
         if can_id in self._name_by_status_can_id:
@@ -717,6 +720,7 @@ class MecanumDrive:
         self._lw = lw
         self._last_debug_at = 0.0
         self._last_pid_at = time.monotonic()
+        self._pid_started_at = self._last_pid_at
         self._pid_feedback_missing_logged = False
         self.pid_controllers = {
             name: PIDController(PID_KP, PID_KI, PID_KD, PID_OUTPUT_LIMIT, PID_INTEGRAL_LIMIT)
@@ -819,7 +823,7 @@ class MecanumDrive:
         self._last_pid_at = now
 
         if feedback_values is None:
-            if not self._pid_feedback_missing_logged:
+            if not self._pid_feedback_missing_logged and now - self._pid_started_at >= 1.0:
                 self._pid_feedback_missing_logged = True
                 print("[WARN] PID_ENABLE=1 ですが有効なEDULITE05エンコーダ速度がありません。開ループ指令を送信します。")
             return targets, None
