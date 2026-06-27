@@ -263,6 +263,30 @@ EDULITE05 のファームウェアやUSB-CAN変換器の応答形式が異なる
 
 テスト用に外部ファイルから正規化速度を入れる場合だけ、`PID_FEEDBACK_SOURCE=file PID_FEEDBACK_FILE=/tmp/edulite05_wheel_speed.json` を指定できます。
 
+### リアルタイムGUIダッシュボード
+
+プログラム起動中は、同じネットワークのブラウザで以下を開くと状態を確認できます。
+
+```text
+http://172.21.6.147:8080
+```
+
+表示内容:
+
+- DualSense 接続状態と制御ループ周期
+- `vx / vy / omega` の入力値
+- 各ホイールの目標値、スルーレート後の目標値、PID補正後の最終指令
+- EDULITE05 エンコーダの生値と正規化速度
+- PIDフィードバックが取れているかどうか
+
+```bash
+# GUIを無効化
+DASHBOARD_ENABLE=0 uv run python mecanum_rc.py
+
+# ポートを変える
+DASHBOARD_PORT=8081 uv run python mecanum_rc.py
+```
+
 ---
 
 ## 🔌 接続先を変える場合

@@ -44,6 +44,8 @@ import time
 import sys
 import subprocess
 import select
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
@@ -184,6 +186,11 @@ DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
 # 制御ループ周期
 CONTROL_HZ = int(os.getenv("CONTROL_HZ", "20"))  # Hz
 
+DASHBOARD_ENABLE = _env_flag("DASHBOARD_ENABLE", "1")
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
+DASHBOARD_EVENT_HZ = max(1.0, float(os.getenv("DASHBOARD_EVENT_HZ", "10")))
+
 
 def candidate_serial_ports() -> list[str]:
     ports: list[str] = []
@@ -257,6 +264,172 @@ WHEEL_NAMES = ("FL", "FR", "RL", "RR")
 def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
+
+
+DASHBOARD_HTML = r"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROX Realtime Dashboard</title>
+<style>
+:root{color-scheme:dark;--bg:#101318;--panel:#181d24;--panel2:#202733;--text:#eef2f7;--muted:#9aa7b6;--accent:#41d39b;--warn:#ffca66;--bad:#ff6b6b;--line:#2b3442}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}.wrap{max-width:1200px;margin:0 auto;padding:18px}.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:16px}.title h1{margin:0;font-size:24px;font-weight:700}.title p{margin:4px 0 0;color:var(--muted);font-size:13px}.pill{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:13px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}h2{font-size:15px;margin:0 0 12px;font-weight:700}.kv{display:grid;grid-template-columns:120px 1fr;gap:7px;font-size:13px}.k{color:var(--muted)}.v{font-variant-numeric:tabular-nums}.wheels{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.wheel{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}.wheel h3{margin:0 0 8px;font-size:14px}.metric{margin:8px 0}.metric .label{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px}.bar{height:8px;background:#0b0e12;border-radius:999px;overflow:hidden}.fill{height:100%;width:0;background:var(--accent);transform-origin:left center}.fill.neg{background:var(--warn)}.num{font-variant-numeric:tabular-nums;color:var(--text)}.status-ok{color:var(--accent)}.status-warn{color:var(--warn)}.status-bad{color:var(--bad)}@media(max-width:900px){.span4,.span6,.span8{grid-column:span 12}.wheels{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.wrap{padding:12px}.top{align-items:flex-start;flex-direction:column}.wheels{grid-template-columns:1fr}.kv{grid-template-columns:96px 1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="title"><h1>ROX Realtime Dashboard</h1><p>DualSense / EDULITE05 / PID telemetry</p></div>
+    <div class="pill">更新: <span id="age">--</span> ms</div>
+  </div>
+  <div class="grid">
+    <section class="panel span4"><h2>System</h2><div class="kv" id="system"></div></section>
+    <section class="panel span4"><h2>Input</h2><div class="kv" id="input"></div></section>
+    <section class="panel span4"><h2>PID</h2><div class="kv" id="pid"></div></section>
+    <section class="panel span12"><h2>Wheels</h2><div class="wheels" id="wheels"></div></section>
+  </div>
+</div>
+<script>
+const names=["FL","FR","RL","RR"];
+const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):"--";
+const cls=(ok)=>ok?"status-ok":"status-warn";
+function kv(id, rows){document.getElementById(id).innerHTML=rows.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("");}
+function bar(label,value){const v=Number(value);const pct=Math.min(100,Math.abs(v)*100);const neg=v<0;return `<div class="metric"><div class="label"><span>${label}</span><span class="num">${fmt(v,3)}</span></div><div class="bar"><div class="fill ${neg?'neg':''}" style="width:${pct}%"></div></div></div>`;}
+function render(s){
+  const now=Date.now()/1000; document.getElementById('age').textContent=fmt((now-(s.updated_at||now))*1000,0);
+  const c=s.controller||{}, p=s.pid||{}, inp=s.input||{}, wh=s.wheels||{};
+  kv('system',[["status",s.status||"--"],["controller",`<span class="${cls(c.connected)}">${c.connected?'connected':'waiting'}</span>`],["backend",c.backend||"--"],["loop",fmt(s.loop_hz,1)+" Hz"],["seq",s.seq||0]]);
+  kv('input',[["vx",fmt(inp.vx,3)],["vy",fmt(inp.vy,3)],["omega",fmt(inp.omega,3)],["idle",inp.idle?"yes":"no"]]);
+  kv('pid',[["enabled",p.enabled?"ON":"OFF"],["feedback",`<span class="${cls(p.feedback_ok)}">${p.feedback_ok?'OK':'none'}</span>`],["kp/ki/kd",`${fmt(p.kp,3)} / ${fmt(p.ki,3)} / ${fmt(p.kd,3)}`],["limit",fmt(p.output_limit,2)]]);
+  document.getElementById('wheels').innerHTML=names.map(n=>`<div class="wheel"><h3>${n}</h3>${bar('raw target',(wh.raw_target||{})[n])}${bar('slew target',(wh.pid_target||{})[n])}${bar('command',(wh.command||{})[n])}${bar('measured',(wh.measured||{})[n])}${bar('pid corr',(wh.pid_correction||{})[n])}<div class="metric"><div class="label"><span>encoder</span><span class="num">${fmt((wh.encoder||{})[n],0)}</span></div></div></div>`).join('');
+}
+const es=new EventSource('/events');
+es.onmessage=(ev)=>render(JSON.parse(ev.data));
+es.onerror=()=>{kv('system',[["status",'<span class="status-bad">disconnected</span>']]);};
+fetch('/snapshot').then(r=>r.json()).then(render).catch(()=>{});
+</script>
+</body>
+</html>
+"""
+
+
+class DashboardState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._seq = 0
+        now = time.time()
+        self._snapshot = {
+            "seq": 0,
+            "status": "starting",
+            "updated_at": now,
+            "loop_hz": 0.0,
+            "controller": {"connected": False, "backend": ""},
+            "input": {"vx": 0.0, "vy": 0.0, "omega": 0.0, "idle": True},
+            "pid": {
+                "enabled": PID_ENABLE,
+                "feedback_ok": False,
+                "kp": PID_KP,
+                "ki": PID_KI,
+                "kd": PID_KD,
+                "output_limit": PID_OUTPUT_LIMIT,
+            },
+            "wheels": {
+                "raw_target": {name: 0.0 for name in WHEEL_NAMES},
+                "pid_target": {name: 0.0 for name in WHEEL_NAMES},
+                "command": {name: 0.0 for name in WHEEL_NAMES},
+                "measured": {name: 0.0 for name in WHEEL_NAMES},
+                "pid_correction": {name: 0.0 for name in WHEEL_NAMES},
+                "encoder": {name: 0.0 for name in WHEEL_NAMES},
+            },
+        }
+
+    def update(self, patch: dict) -> None:
+        with self._lock:
+            self._seq += 1
+            self._merge(self._snapshot, patch)
+            self._snapshot["seq"] = self._seq
+            self._snapshot["updated_at"] = time.time()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return json.loads(json.dumps(self._snapshot))
+
+    def _merge(self, target: dict, patch: dict) -> None:
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                self._merge(target[key], value)
+            else:
+                target[key] = value
+
+
+class DashboardRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path in {"/", "/index.html"}:
+            body = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/snapshot":
+            self._send_json(self.server.dashboard_state.snapshot())
+            return
+        if self.path == "/events":
+            self._send_events()
+            return
+        self.send_error(404)
+
+    def _send_json(self, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_events(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        interval = 1.0 / DASHBOARD_EVENT_HZ
+        while not self.server.stop_event.is_set():
+            payload = json.dumps(self.server.dashboard_state.snapshot()).encode("utf-8")
+            try:
+                self.wfile.write(b"data: " + payload + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+            time.sleep(interval)
+
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+
+class DashboardServer:
+    def __init__(self, state: DashboardState, host: str, port: int):
+        self.state = state
+        self.host = host
+        self.port = port
+        self.httpd = ThreadingHTTPServer((host, port), DashboardRequestHandler)
+        self.httpd.dashboard_state = state
+        self.httpd.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.httpd.stop_event.set()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=1.0)
 
 class PIDController:
     """正規化速度 [-1, +1] を扱う単純な PID コントローラー"""
@@ -731,7 +904,9 @@ class MecanumDrive:
       v_RR =  vx - vy + ω*(L+W)    (取付方向で反転)
     """
 
-    def __init__(self, bus: SerialATBus):
+    def __init__(self, bus: SerialATBus, dashboard: DashboardState | None = None):
+        self.dashboard = dashboard
+        self._last_dashboard_at = time.monotonic()
         self.motors = {
             name: EDULITE05(bus, mid) for name, mid in MOTOR_ID.items()
         }
@@ -805,6 +980,8 @@ class MecanumDrive:
             "RL": rl_out,
             "RR": rr_out,
         }
+        raw_wheel_targets = dict(wheel_targets)
+        pid_input_targets = dict(wheel_targets)
         operator_idle = max(abs(vx), abs(vy), abs(omega)) < IDLE_COMMAND_DEADBAND
         feedback_values = None
         if operator_idle:
@@ -812,11 +989,13 @@ class MecanumDrive:
             for pid in self.pid_controllers.values():
                 pid.reset()
             wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
+            pid_input_targets = dict(wheel_targets)
             self._last_wheel_targets = dict(wheel_targets)
             self._last_wheel_target_at = time.monotonic()
         else:
             self._idle_active = False
             wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
+            pid_input_targets = dict(wheel_targets)
             if PID_ENABLE:
                 wheel_targets, feedback_values = self._apply_pid(wheel_targets)
 
@@ -824,6 +1003,7 @@ class MecanumDrive:
         self.motors["FR"].set_velocity(wheel_targets["FR"])
         self.motors["RL"].set_velocity(wheel_targets["RL"])
         self.motors["RR"].set_velocity(wheel_targets["RR"])
+        self._publish_dashboard(vx, vy, omega, raw_wheel_targets, pid_input_targets, wheel_targets, feedback_values)
 
         if DEBUG_INPUT:
             now = time.monotonic()
@@ -846,6 +1026,56 @@ class MecanumDrive:
                     f"RL={wheel_targets['RL']:+.2f} RR={wheel_targets['RR']:+.2f}"
                     f"{pid_text}"
                 )
+
+
+    def _publish_dashboard(
+        self,
+        vx: float,
+        vy: float,
+        omega: float,
+        raw_targets: dict[str, float],
+        pid_targets: dict[str, float],
+        commands: dict[str, float],
+        feedback_values: dict[str, float] | None,
+    ) -> None:
+        if self.dashboard is None:
+            return
+
+        now = time.monotonic()
+        dt = now - self._last_dashboard_at
+        self._last_dashboard_at = now
+        loop_hz = 1.0 / dt if dt > 0.0 else 0.0
+        measured = feedback_values or {name: 0.0 for name in WHEEL_NAMES}
+        correction = {
+            name: commands.get(name, 0.0) - pid_targets.get(name, 0.0)
+            for name in WHEEL_NAMES
+        }
+        encoder_values = {}
+        if self.feedback is not None and hasattr(self.feedback, "current_values"):
+            encoder_values = self.feedback.current_values()
+
+        self.dashboard.update({
+            "status": "running",
+            "loop_hz": loop_hz,
+            "input": {
+                "vx": vx,
+                "vy": vy,
+                "omega": omega,
+                "idle": self._idle_active,
+            },
+            "pid": {
+                "enabled": PID_ENABLE,
+                "feedback_ok": feedback_values is not None,
+            },
+            "wheels": {
+                "raw_target": raw_targets,
+                "pid_target": pid_targets,
+                "command": commands,
+                "measured": measured,
+                "pid_correction": correction,
+                "encoder": encoder_values,
+            },
+        })
 
     def _apply_wheel_slew_limit(self, targets: dict[str, float]) -> dict[str, float]:
         if WHEEL_COMMAND_SLEW_RATE <= 0.0:
@@ -1552,6 +1782,8 @@ def main() -> None:
     controller = None
     robot = None
     transport = None
+    dashboard = DashboardState() if DASHBOARD_ENABLE else None
+    dashboard_server = None
 
     print("=" * 50)
     print("  メカナムホイール 4WD ラジコン 起動中...")
@@ -1560,6 +1792,15 @@ def main() -> None:
         print("  [DEBUG] 入力デバッグ表示: ON")
     else:
         print("  [DEBUG] 入力デバッグ表示: OFF (有効化: DEBUG_INPUT=1)")
+    if dashboard is not None:
+        try:
+            dashboard_server = DashboardServer(dashboard, DASHBOARD_HOST, DASHBOARD_PORT)
+            dashboard_server.start()
+            print(f"  [GUI] リアルタイム表示: http://172.21.6.147:{DASHBOARD_PORT}")
+        except OSError as e:
+            dashboard.update({"status": "dashboard_error"})
+            dashboard = None
+            print(f"  [WARN] GUIダッシュボードを起動できません: {e}")
     print(
         "  [設定] "
         f"speed_limit={AT_SPEED_PERCENT:.0f}% "
@@ -1586,6 +1827,11 @@ def main() -> None:
     try:
         # ステップ 1: DualSense 接続待機
         controller = DualSenseController()
+        if dashboard is not None:
+            dashboard.update({
+                "status": "controller_connected",
+                "controller": {"connected": True, "backend": controller.backend or ""},
+            })
 
         # ステップ 2: シリアル接続
         print(f"[手順 2/3] シリアル接続中...")
@@ -1602,14 +1848,18 @@ def main() -> None:
                 f"\n  詳細: {e}\n"
             )
         print(f"           ✓ シリアル接続準備完了")
+        if dashboard is not None:
+            dashboard.update({"status": "serial_connected"})
 
         # ステップ 3: モーター起動
         print(f"[手順 3/3] モーターをイネーブルにしています...")
-        robot = MecanumDrive(transport)
+        robot = MecanumDrive(transport, dashboard)
         robot.enable_all()
         # イネーブル直後に必ず停止コマンドを送って安全側に倒す
         robot.stop()
         print(f"           ✓ 全モーター起動完了")
+        if dashboard is not None:
+            dashboard.update({"status": "ready"})
 
         print()
         print("=" * 50)
@@ -1637,6 +1887,11 @@ def main() -> None:
 
             if time.monotonic() < startup_guard_until:
                 robot.stop()
+                if dashboard is not None:
+                    dashboard.update({
+                        "status": "startup_stop",
+                        "input": {"vx": vx, "vy": vy, "omega": omega, "idle": True},
+                    })
                 elapsed = time.monotonic() - t_start
                 sleep_time = interval - elapsed
                 if sleep_time > 0:
@@ -1659,6 +1914,8 @@ def main() -> None:
         print(f"\n[予期しないエラー] {e}", file=sys.stderr)
         raise
     finally:
+        if dashboard is not None:
+            dashboard.update({"status": "shutting_down"})
         if robot:
             try:
                 robot.stop()
@@ -1670,6 +1927,8 @@ def main() -> None:
             transport.close()
         if controller:
             controller.close()
+        if dashboard_server:
+            dashboard_server.stop()
         print("\n  シャットダウン完了。")
 
 
