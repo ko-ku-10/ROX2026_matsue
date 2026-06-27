@@ -1,0 +1,13 @@
+[project]
+name = "mecanum-rc"
+version = "0.1.0"
+description = "Mecanum wheel RC car with Robstride EDULITE05 + DualSense"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pygame>=2.5.0",
+    "evdev>=1.7.1",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+mecanum-rc = "mecanum_rc:main"
