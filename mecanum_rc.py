@@ -39,9 +39,11 @@ import pygame
 import os
 import glob
 import json
+import struct
 import time
 import sys
 import subprocess
+import select
 from pathlib import Path
 
 try:
@@ -150,9 +152,22 @@ PID_KI = float(os.getenv("PID_KI", "0.0"))
 PID_KD = float(os.getenv("PID_KD", "0.0"))
 PID_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("PID_OUTPUT_LIMIT", "0.35"))))
 PID_INTEGRAL_LIMIT = max(0.0, float(os.getenv("PID_INTEGRAL_LIMIT", "0.5")))
+PID_FEEDBACK_SOURCE = os.getenv("PID_FEEDBACK_SOURCE", "edulite05_encoder").strip().lower()
 PID_FEEDBACK_FILE = os.getenv("PID_FEEDBACK_FILE", "").strip()
 PID_FEEDBACK_STALE_SEC = max(0.0, float(os.getenv("PID_FEEDBACK_STALE_SEC", "0.25")))
 PID_RESET_ON_STOP = _env_flag("PID_RESET_ON_STOP", "1")
+
+# EDULITE05 のロータリーエンコーダ値を速度フィードバックへ変換する設定
+EDULITE05_ENCODER_QUERY_ENABLE = _env_flag("EDULITE05_ENCODER_QUERY_ENABLE", "1")
+EDULITE05_ENCODER_QUERY_INTERVAL = max(0.0, float(os.getenv("EDULITE05_ENCODER_QUERY_INTERVAL", "0.02")))
+EDULITE05_ENCODER_REGISTER = int(os.getenv("EDULITE05_ENCODER_REGISTER", "0x7019"), 0)
+EDULITE05_ENCODER_FORMAT = os.getenv("EDULITE05_ENCODER_FORMAT", "float32").strip().lower()
+EDULITE05_ENCODER_VALUE_OFFSET = int(os.getenv("EDULITE05_ENCODER_VALUE_OFFSET", "4"))
+EDULITE05_ENCODER_COUNTS_PER_REV = max(1.0, float(os.getenv("EDULITE05_ENCODER_COUNTS_PER_REV", "65536")))
+EDULITE05_ENCODER_MAX_RPS = max(0.001, float(os.getenv("EDULITE05_ENCODER_MAX_RPS", "5.0")))
+EDULITE05_ENCODER_STALE_SEC = max(0.0, float(os.getenv("EDULITE05_ENCODER_STALE_SEC", "0.25")))
+EDULITE05_ENCODER_UNITS = os.getenv("EDULITE05_ENCODER_UNITS", "radians").strip().lower()
+EDULITE05_ENCODER_WRAP_RADIANS = _env_flag("EDULITE05_ENCODER_WRAP_RADIANS", "1")
 
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
@@ -214,6 +229,15 @@ def _build_velocity_cmd_value(motor_addr: int, at_value: int) -> bytes:
     ])
 
 
+def _build_read_register_cmd(motor_addr: int, register_index: int) -> bytes:
+    index = max(0x0000, min(0xFFFF, int(register_index)))
+    return bytes([
+        0x41, 0x54, 0x90, 0x07, 0xE8, motor_addr,
+        0x08, index & 0xFF, (index >> 8) & 0xFF, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x0D, 0x0A,
+    ])
+
+
 # ============================================================
 # PID制御 / ホイール速度フィードバック
 # ============================================================
@@ -258,13 +282,7 @@ class PIDController:
 
 
 class WheelSpeedFeedback:
-    """外部プロセスが書くホイール速度ファイルを読み取る。
-
-    値は各ホイールの正規化速度 [-1, +1] として扱う。JSON なら
-    {"FL": 0.1, "FR": -0.1, "RL": 0.1, "RR": -0.1}、
-    テキストなら "FL=0.1 FR=-0.1 RL=0.1 RR=-0.1" または
-    "0.1,-0.1,0.1,-0.1" の順序で指定できる。
-    """
+    """テスト用: 外部ファイルに書かれた正規化ホイール速度を読み取る。"""
 
     def __init__(self, path: str):
         self.path = Path(path) if path else None
@@ -330,6 +348,131 @@ class WheelSpeedFeedback:
         return values
 
 
+class EDULITE05EncoderFeedback:
+    """EDULITE05 のロータリーエンコーダ値からホイール速度を推定する。"""
+
+    def __init__(self, bus: "SerialATBus", motor_ids: dict[str, int]):
+        self.bus = bus
+        self.motor_ids = motor_ids
+        self._name_by_addr = {addr: name for name, addr in motor_ids.items()}
+        self._name_by_index = {addr >> 3: name for name, addr in motor_ids.items()}
+        self._last_query_at = 0.0
+        self._last_value: dict[str, float] = {}
+        self._last_sample_at: dict[str, float] = {}
+        self._speeds: dict[str, float] = {}
+        self._speed_updated_at: dict[str, float] = {}
+
+    def read(self) -> dict[str, float] | None:
+        now = time.monotonic()
+        self._query_if_needed(now)
+        for frame_type, can_id, motor_addr, data in self.bus.read_frames():
+            self._handle_frame(motor_addr, data, now)
+
+        fresh = {
+            name: speed
+            for name, speed in self._speeds.items()
+            if EDULITE05_ENCODER_STALE_SEC <= 0.0
+            or now - self._speed_updated_at.get(name, 0.0) <= EDULITE05_ENCODER_STALE_SEC
+        }
+        return fresh or None
+
+    def _query_if_needed(self, now: float) -> None:
+        if not EDULITE05_ENCODER_QUERY_ENABLE:
+            return
+        if now - self._last_query_at < EDULITE05_ENCODER_QUERY_INTERVAL:
+            return
+        self._last_query_at = now
+        for motor_addr in self.motor_ids.values():
+            try:
+                self.bus.write(_build_read_register_cmd(motor_addr, EDULITE05_ENCODER_REGISTER))
+            except (serial.SerialException, OSError) as e:
+                print(f"[WARN] EDULITE05 エンコーダ読み取り要求に失敗: {e}")
+
+    def _handle_frame(self, motor_addr: int, data: bytes, now: float) -> None:
+        name = self._motor_name(motor_addr)
+        if name is None:
+            return
+        encoder_value = self._extract_encoder_value(data)
+        if encoder_value is None:
+            return
+
+        last_value = self._last_value.get(name)
+        last_at = self._last_sample_at.get(name)
+        self._last_value[name] = encoder_value
+        self._last_sample_at[name] = now
+        if last_value is None or last_at is None:
+            return
+
+        dt = now - last_at
+        if dt <= 0.0:
+            return
+        self._speeds[name] = self._encoder_delta_to_speed(encoder_value - last_value, dt)
+        self._speed_updated_at[name] = now
+
+    def _motor_name(self, motor_addr: int) -> str | None:
+        if motor_addr in self._name_by_addr:
+            return self._name_by_addr[motor_addr]
+        return self._name_by_index.get(motor_addr >> 3)
+
+    def _extract_encoder_value(self, data: bytes) -> float | None:
+        if len(data) < EDULITE05_ENCODER_VALUE_OFFSET + 1:
+            return None
+
+        if len(data) >= 2:
+            register_index = data[0] | (data[1] << 8)
+            if register_index != EDULITE05_ENCODER_REGISTER:
+                return None
+
+        offset = EDULITE05_ENCODER_VALUE_OFFSET
+        value_bytes = data[offset:]
+        try:
+            if EDULITE05_ENCODER_FORMAT == "float32":
+                if len(value_bytes) < 4:
+                    return None
+                return float(struct.unpack("<f", value_bytes[:4])[0])
+            if EDULITE05_ENCODER_FORMAT == "int32":
+                if len(value_bytes) < 4:
+                    return None
+                return float(int.from_bytes(value_bytes[:4], "little", signed=True))
+            if EDULITE05_ENCODER_FORMAT == "uint32":
+                if len(value_bytes) < 4:
+                    return None
+                return float(int.from_bytes(value_bytes[:4], "little", signed=False))
+            if EDULITE05_ENCODER_FORMAT == "uint16_be":
+                if len(value_bytes) < 2:
+                    return None
+                return float(int.from_bytes(value_bytes[:2], "big", signed=False))
+            if EDULITE05_ENCODER_FORMAT == "int16":
+                if len(value_bytes) < 2:
+                    return None
+                return float(int.from_bytes(value_bytes[:2], "little", signed=True))
+            if len(value_bytes) < 2:
+                return None
+            return float(int.from_bytes(value_bytes[:2], "little", signed=False))
+        except (struct.error, ValueError):
+            return None
+
+    def _encoder_delta_to_speed(self, delta: float, dt: float) -> float:
+        if EDULITE05_ENCODER_UNITS == "radians":
+            if EDULITE05_ENCODER_WRAP_RADIANS:
+                wrap_threshold = 4.0
+                if delta > wrap_threshold:
+                    delta -= 6.283185307179586
+                elif delta < -wrap_threshold:
+                    delta += 6.283185307179586
+            rps = (delta / 6.283185307179586) / dt
+        elif EDULITE05_ENCODER_UNITS == "revolutions":
+            rps = delta / dt
+        else:
+            half_cpr = EDULITE05_ENCODER_COUNTS_PER_REV / 2.0
+            if delta > half_cpr:
+                delta -= EDULITE05_ENCODER_COUNTS_PER_REV
+            elif delta < -half_cpr:
+                delta += EDULITE05_ENCODER_COUNTS_PER_REV
+            rps = (delta / EDULITE05_ENCODER_COUNTS_PER_REV) / dt
+        return _clamp(rps / EDULITE05_ENCODER_MAX_RPS)
+
+
 # ============================================================
 # モータークラス
 # ============================================================
@@ -339,6 +482,7 @@ class SerialATBus:
         self.ser = None
         self.raw_fd: int | None = None
         self._last_write_at: float = 0.0
+        self._read_buffer = bytearray()
         last_error: Exception | None = None
         tried_ports = candidate_serial_ports()
 
@@ -400,6 +544,52 @@ class SerialATBus:
                 raise serial.SerialException(f"raw write failed: {e}") from e
             return
         raise RuntimeError("シリアルポートが初期化されていません")
+
+    def read_available(self) -> bytes:
+        if self.ser is not None:
+            waiting = getattr(self.ser, "in_waiting", 0)
+            if waiting <= 0:
+                return b""
+            return self.ser.read(waiting)
+        if self.raw_fd is not None:
+            readable, _, _ = select.select([self.raw_fd], [], [], 0.0)
+            if not readable:
+                return b""
+            return os.read(self.raw_fd, 4096)
+        return b""
+
+    def read_frames(self) -> list[tuple[int, int, int, bytes]]:
+        chunk = self.read_available()
+        if chunk:
+            self._read_buffer.extend(chunk)
+
+        frames: list[tuple[int, int, int, bytes]] = []
+        while True:
+            start = self._read_buffer.find(b"AT")
+            if start < 0:
+                self._read_buffer.clear()
+                break
+            if start > 0:
+                del self._read_buffer[:start]
+            if len(self._read_buffer) < 9:
+                break
+
+            dlc = self._read_buffer[6]
+            total_len = 7 + dlc + 2
+            if len(self._read_buffer) < total_len:
+                break
+            if self._read_buffer[total_len - 2:total_len] != b"\r\n":
+                del self._read_buffer[0]
+                continue
+
+            frame_type = self._read_buffer[2]
+            can_id = (self._read_buffer[3] << 8) | self._read_buffer[4]
+            motor_addr = self._read_buffer[5]
+            data = bytes(self._read_buffer[7:7 + dlc])
+            frames.append((frame_type, can_id, motor_addr, data))
+            del self._read_buffer[:total_len]
+
+        return frames
 
     def close(self) -> None:
         if self.ser is not None:
@@ -515,7 +705,12 @@ class MecanumDrive:
             name: PIDController(PID_KP, PID_KI, PID_KD, PID_OUTPUT_LIMIT, PID_INTEGRAL_LIMIT)
             for name in WHEEL_NAMES
         } if PID_ENABLE else {}
-        self.feedback = WheelSpeedFeedback(PID_FEEDBACK_FILE) if PID_ENABLE else None
+        if PID_ENABLE and PID_FEEDBACK_SOURCE == "file":
+            self.feedback = WheelSpeedFeedback(PID_FEEDBACK_FILE)
+        elif PID_ENABLE:
+            self.feedback = EDULITE05EncoderFeedback(bus, MOTOR_ID)
+        else:
+            self.feedback = None
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -609,7 +804,7 @@ class MecanumDrive:
         if feedback_values is None:
             if not self._pid_feedback_missing_logged:
                 self._pid_feedback_missing_logged = True
-                print("[WARN] PID_ENABLE=1 ですが有効な速度フィードバックがありません。開ループ指令を送信します。")
+                print("[WARN] PID_ENABLE=1 ですが有効なEDULITE05エンコーダ速度がありません。開ループ指令を送信します。")
             return targets, None
 
         self._pid_feedback_missing_logged = False
@@ -1290,7 +1485,9 @@ def main() -> None:
         f"status={'ON' if PID_ENABLE else 'OFF'} "
         f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
         f"limit={PID_OUTPUT_LIMIT:.2f} "
-        f"feedback_file={PID_FEEDBACK_FILE or '未設定'}"
+        f"source={PID_FEEDBACK_SOURCE} "
+        f"encoder_reg=0x{EDULITE05_ENCODER_REGISTER:04X} "
+        f"encoder_format={EDULITE05_ENCODER_FORMAT}"
     )
 
     try:
