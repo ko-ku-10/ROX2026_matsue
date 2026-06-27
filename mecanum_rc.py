@@ -144,6 +144,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 DEBUG_INPUT = _env_flag("DEBUG_INPUT", "1")
+DEBUG_ENCODER = _env_flag("DEBUG_ENCODER", "0")
 
 # PID速度制御（フィードバック速度が取れる場合のみ有効化する）
 PID_ENABLE = _env_flag("PID_ENABLE", "0")
@@ -161,13 +162,14 @@ PID_RESET_ON_STOP = _env_flag("PID_RESET_ON_STOP", "1")
 EDULITE05_ENCODER_QUERY_ENABLE = _env_flag("EDULITE05_ENCODER_QUERY_ENABLE", "1")
 EDULITE05_ENCODER_QUERY_INTERVAL = max(0.0, float(os.getenv("EDULITE05_ENCODER_QUERY_INTERVAL", "0.02")))
 EDULITE05_ENCODER_REGISTER = int(os.getenv("EDULITE05_ENCODER_REGISTER", "0x7019"), 0)
-EDULITE05_ENCODER_FORMAT = os.getenv("EDULITE05_ENCODER_FORMAT", "float32").strip().lower()
-EDULITE05_ENCODER_VALUE_OFFSET = int(os.getenv("EDULITE05_ENCODER_VALUE_OFFSET", "4"))
+EDULITE05_ENCODER_FORMAT = os.getenv("EDULITE05_ENCODER_FORMAT", "uint16").strip().lower()
+EDULITE05_ENCODER_VALUE_OFFSET = int(os.getenv("EDULITE05_ENCODER_VALUE_OFFSET", "0"))
 EDULITE05_ENCODER_COUNTS_PER_REV = max(1.0, float(os.getenv("EDULITE05_ENCODER_COUNTS_PER_REV", "65536")))
 EDULITE05_ENCODER_MAX_RPS = max(0.001, float(os.getenv("EDULITE05_ENCODER_MAX_RPS", "5.0")))
 EDULITE05_ENCODER_STALE_SEC = max(0.0, float(os.getenv("EDULITE05_ENCODER_STALE_SEC", "0.25")))
-EDULITE05_ENCODER_UNITS = os.getenv("EDULITE05_ENCODER_UNITS", "radians").strip().lower()
+EDULITE05_ENCODER_UNITS = os.getenv("EDULITE05_ENCODER_UNITS", "counts").strip().lower()
 EDULITE05_ENCODER_WRAP_RADIANS = _env_flag("EDULITE05_ENCODER_WRAP_RADIANS", "1")
+EDULITE05_ENCODER_FRAME = os.getenv("EDULITE05_ENCODER_FRAME", "status").strip().lower()
 
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
@@ -356,7 +358,9 @@ class EDULITE05EncoderFeedback:
         self.motor_ids = motor_ids
         self._name_by_addr = {addr: name for name, addr in motor_ids.items()}
         self._name_by_index = {addr >> 3: name for name, addr in motor_ids.items()}
+        self._name_by_status_can_id = {addr + 3: name for name, addr in motor_ids.items()}
         self._last_query_at = 0.0
+        self._last_debug_at = 0.0
         self._last_value: dict[str, float] = {}
         self._last_sample_at: dict[str, float] = {}
         self._speeds: dict[str, float] = {}
@@ -366,7 +370,7 @@ class EDULITE05EncoderFeedback:
         now = time.monotonic()
         self._query_if_needed(now)
         for frame_type, can_id, motor_addr, data in self.bus.read_frames():
-            self._handle_frame(motor_addr, data, now)
+            self._handle_frame(frame_type, can_id, motor_addr, data, now)
 
         fresh = {
             name: speed
@@ -388,11 +392,11 @@ class EDULITE05EncoderFeedback:
             except (serial.SerialException, OSError) as e:
                 print(f"[WARN] EDULITE05 エンコーダ読み取り要求に失敗: {e}")
 
-    def _handle_frame(self, motor_addr: int, data: bytes, now: float) -> None:
-        name = self._motor_name(motor_addr)
+    def _handle_frame(self, frame_type: int, can_id: int, motor_addr: int, data: bytes, now: float) -> None:
+        name = self._motor_name(frame_type, can_id, motor_addr)
         if name is None:
             return
-        encoder_value = self._extract_encoder_value(data)
+        encoder_value = self._extract_encoder_value(frame_type, can_id, data)
         if encoder_value is None:
             return
 
@@ -408,17 +412,30 @@ class EDULITE05EncoderFeedback:
             return
         self._speeds[name] = self._encoder_delta_to_speed(encoder_value - last_value, dt)
         self._speed_updated_at[name] = now
+        if DEBUG_ENCODER and now - self._last_debug_at >= 0.5:
+            self._last_debug_at = now
+            print(
+                "[ENCODER] "
+                f"{name} value={encoder_value:+.4f} "
+                f"delta={encoder_value - last_value:+.4f} "
+                f"dt={dt:.3f}s speed={self._speeds[name]:+.3f}"
+            )
 
-    def _motor_name(self, motor_addr: int) -> str | None:
+    def _motor_name(self, frame_type: int, can_id: int, motor_addr: int) -> str | None:
+        if can_id in self._name_by_status_can_id:
+            return self._name_by_status_can_id[can_id]
+        if (can_id & 0xFF) in self._name_by_status_can_id:
+            return self._name_by_status_can_id[can_id & 0xFF]
         if motor_addr in self._name_by_addr:
             return self._name_by_addr[motor_addr]
         return self._name_by_index.get(motor_addr >> 3)
 
-    def _extract_encoder_value(self, data: bytes) -> float | None:
+    def _extract_encoder_value(self, frame_type: int, can_id: int, data: bytes) -> float | None:
         if len(data) < EDULITE05_ENCODER_VALUE_OFFSET + 1:
             return None
 
-        if len(data) >= 2:
+        is_status_frame = frame_type == 0x10 or can_id in self._name_by_status_can_id
+        if EDULITE05_ENCODER_FRAME != "status" and not is_status_frame and len(data) >= 2:
             register_index = data[0] | (data[1] << 8)
             if register_index != EDULITE05_ENCODER_REGISTER:
                 return None
@@ -1486,7 +1503,7 @@ def main() -> None:
         f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
         f"limit={PID_OUTPUT_LIMIT:.2f} "
         f"source={PID_FEEDBACK_SOURCE} "
-        f"encoder_reg=0x{EDULITE05_ENCODER_REGISTER:04X} "
+        f"encoder_frame={EDULITE05_ENCODER_FRAME} "
         f"encoder_format={EDULITE05_ENCODER_FORMAT}"
     )
 

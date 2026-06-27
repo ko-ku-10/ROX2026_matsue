@@ -217,7 +217,7 @@ AT_SPEED_PERCENT=60 uv run python mecanum_rc.py
 
 このブランチでは EDULITE05 へ送る速度指令の手前に PID 補正レイヤを追加し、`PID_ENABLE=1` のときは EDULITE05 のロータリーエンコーダ値から推定したホイール速度をフィードバックに使います。
 
-既定では、EDULITE05 の機械角レジスタ `0x7019` を周期読み取りし、`float32` の角度値差分から回転速度を計算します。エンコーダ値が読めない場合は警告を出し、従来の開ループ速度指令へフォールバックします。
+既定では、EDULITE05 が返す `AT 10` ステータスフレームを読み取り、データ先頭の `uint16` 角度カウント差分から回転速度を計算します。エンコーダ値が読めない場合は警告を出し、従来の開ループ速度指令へフォールバックします。
 
 起動例:
 
@@ -243,17 +243,17 @@ EDULITE05 エンコーダ読み取り設定:
 
 ```python
 PID_FEEDBACK_SOURCE = "edulite05_encoder"  # 通常はこのまま
-EDULITE05_ENCODER_REGISTER = 0x7019         # エンコーダ値レジスタ
-EDULITE05_ENCODER_FORMAT = "float32"        # EDULITE05の機械角。uint16等にも変更可能
-EDULITE05_ENCODER_VALUE_OFFSET = 4          # 応答データ内の値開始位置
-EDULITE05_ENCODER_UNITS = "radians"         # 角度値の単位。counts / revolutions も指定可能
-EDULITE05_ENCODER_COUNTS_PER_REV = 65536    # units=counts の場合の1回転カウント数
+EDULITE05_ENCODER_FRAME = "status"         # AT 10 ステータスフレームを使用
+EDULITE05_ENCODER_FORMAT = "uint16"         # ステータスデータ先頭2バイト
+EDULITE05_ENCODER_VALUE_OFFSET = 0          # 応答データ内の値開始位置
+EDULITE05_ENCODER_UNITS = "counts"          # 角度カウント値として扱う
+EDULITE05_ENCODER_COUNTS_PER_REV = 65536    # 1回転あたりのカウント数
 EDULITE05_ENCODER_MAX_RPS = 5.0             # 正規化速度1.0に相当する回転数[rev/s]
 EDULITE05_ENCODER_QUERY_INTERVAL = 0.02     # 読み取り周期[秒]
 EDULITE05_ENCODER_STALE_SEC = 0.25          # 古いエンコーダ値を無効化する秒数
 ```
 
-EDULITE05 のファームウェアやUSB-CAN変換器の応答形式が異なる場合は、まず `EDULITE05_ENCODER_FORMAT` と `EDULITE05_ENCODER_VALUE_OFFSET` を合わせてください。生の16bitカウントが返る構成では `EDULITE05_ENCODER_UNITS=counts EDULITE05_ENCODER_FORMAT=uint16` のように指定できます。
+EDULITE05 のファームウェアやUSB-CAN変換器の応答形式が異なる場合は、まず `EDULITE05_ENCODER_FORMAT` と `EDULITE05_ENCODER_VALUE_OFFSET` を合わせてください。レジスタ読み取り応答を使う構成では `EDULITE05_ENCODER_FRAME=register EDULITE05_ENCODER_UNITS=radians EDULITE05_ENCODER_FORMAT=float32` のように指定できます。
 
 テスト用に外部ファイルから正規化速度を入れる場合だけ、`PID_FEEDBACK_SOURCE=file PID_FEEDBACK_FILE=/tmp/edulite05_wheel_speed.json` を指定できます。
 
