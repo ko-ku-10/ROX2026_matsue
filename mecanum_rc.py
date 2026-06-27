@@ -122,14 +122,6 @@ INPUT_SLEW_RATE = float(os.getenv("INPUT_SLEW_RATE", "1.2"))
 INPUT_DECEL_SLEW_RATE = float(os.getenv("INPUT_DECEL_SLEW_RATE", "4.0"))
 ROTATION_WHEEL_GAIN = float(os.getenv("ROTATION_WHEEL_GAIN", "3.0"))
 IDLE_COMMAND_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_COMMAND_DEADBAND", "0.08"))))
-IDLE_HOLD_ENABLE = os.getenv("IDLE_HOLD_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on", "y"}
-IDLE_HOLD_POSITION_KP = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_KP", "0.0")))
-IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.24")))
-IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.18"))))
-IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.04"))))
-IDLE_HOLD_POSITION_DEADBAND_REV = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_DEADBAND_REV", "0.003")))
-IDLE_HOLD_MAX_SPEED = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_MAX_SPEED", "1.00"))))
-IDLE_HOLD_RELEASE_SEC = max(0.0, float(os.getenv("IDLE_HOLD_RELEASE_SEC", "0.2")))
 # ニュートラル近傍は0指令へ吸着（方向反転のチャタリング抑制）
 MOTOR_ZERO_HOLD_BAND = float(os.getenv("MOTOR_ZERO_HOLD_BAND", "0.06"))
 MOTOR_ZERO_HOLD_BAND = max(0.0, min(1.0, MOTOR_ZERO_HOLD_BAND))
@@ -185,9 +177,6 @@ EDULITE05_ENCODER_SPEED_FILTER_ALPHA = max(0.0, min(1.0, float(os.getenv("EDULIT
 PID_CORRECTION_DEADBAND = max(0.0, min(1.0, float(os.getenv("PID_CORRECTION_DEADBAND", "0.12"))))
 WHEEL_COMMAND_SLEW_RATE = max(0.0, float(os.getenv("WHEEL_COMMAND_SLEW_RATE", "1.5")))
 WHEEL_COMMAND_DECEL_RATE = max(0.0, float(os.getenv("WHEEL_COMMAND_DECEL_RATE", "6.0")))
-SLIP_GUARD_ENABLE = _env_flag("SLIP_GUARD_ENABLE", "1")
-SLIP_SPEED_ERROR_THRESHOLD = max(0.0, min(1.0, float(os.getenv("SLIP_SPEED_ERROR_THRESHOLD", "0.35"))))
-SLIP_COMMAND_SCALE = max(0.0, min(1.0, float(os.getenv("SLIP_COMMAND_SCALE", "0.75"))))
 
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
@@ -764,10 +753,7 @@ class MecanumDrive:
             self.feedback = None
         self._last_wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
         self._last_wheel_target_at = time.monotonic()
-        self._slip_guard_active = False
         self._idle_active = False
-        self._idle_hold_anchor: dict[str, float] = {}
-        self._idle_hold_release_until = 0.0
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -825,17 +811,11 @@ class MecanumDrive:
             self._idle_active = True
             for pid in self.pid_controllers.values():
                 pid.reset()
-            if IDLE_HOLD_ENABLE and PID_ENABLE and self.feedback is not None:
-                feedback_values = self.feedback.read()
-                wheel_targets = self._apply_idle_hold(feedback_values)
-            else:
-                wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
+            wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
             self._last_wheel_targets = dict(wheel_targets)
             self._last_wheel_target_at = time.monotonic()
         else:
             self._idle_active = False
-            self._idle_hold_anchor = {}
-            self._idle_hold_release_until = time.monotonic() + IDLE_HOLD_RELEASE_SEC
             wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
             if PID_ENABLE:
                 wheel_targets, feedback_values = self._apply_pid(wheel_targets)
@@ -850,18 +830,13 @@ class MecanumDrive:
             if now - self._last_debug_at >= 1.0:
                 self._last_debug_at = now
                 pid_text = " | idle=ON" if self._idle_active else ""
-                if self._idle_active and feedback_values is not None:
-                    pid_text += " hold=ON"
                 if PID_ENABLE and feedback_values is not None:
-                    slip_text = " slip_guard=ON" if self._slip_guard_active else ""
-                    self._slip_guard_active = False
                     measured_text = (
                         " | PID measured "
                         f"FL={feedback_values.get('FL', 0.0):+.2f} "
                         f"FR={feedback_values.get('FR', 0.0):+.2f} "
                         f"RL={feedback_values.get('RL', 0.0):+.2f} "
                         f"RR={feedback_values.get('RR', 0.0):+.2f}"
-                        f"{slip_text}"
                     )
                     pid_text += measured_text
                 print(
@@ -871,24 +846,6 @@ class MecanumDrive:
                     f"RL={wheel_targets['RL']:+.2f} RR={wheel_targets['RR']:+.2f}"
                     f"{pid_text}"
                 )
-
-    def _apply_idle_hold(self, feedback_values: dict[str, float] | None) -> dict[str, float]:
-        now = time.monotonic()
-        if now < self._idle_hold_release_until or not feedback_values:
-            return {name: 0.0 for name in WHEEL_NAMES}
-
-        hold_targets: dict[str, float] = {}
-        for name in WHEEL_NAMES:
-            measured_speed = feedback_values.get(name, 0.0)
-            abs_speed = abs(measured_speed)
-            if abs_speed < IDLE_HOLD_SPEED_DEADBAND:
-                hold_targets[name] = 0.0
-                continue
-
-            limited_speed = _clamp(measured_speed, -IDLE_HOLD_MAX_SPEED, IDLE_HOLD_MAX_SPEED)
-            command = -IDLE_HOLD_DAMPING_KP * limited_speed
-            hold_targets[name] = _clamp(command, -IDLE_HOLD_OUTPUT_LIMIT, IDLE_HOLD_OUTPUT_LIMIT)
-        return hold_targets
 
     def _apply_wheel_slew_limit(self, targets: dict[str, float]) -> dict[str, float]:
         if WHEEL_COMMAND_SLEW_RATE <= 0.0:
@@ -954,10 +911,6 @@ class MecanumDrive:
                 continue
 
             correction = pid.update(target, measured, dt)
-            if SLIP_GUARD_ENABLE and abs(measured - target) > SLIP_SPEED_ERROR_THRESHOLD:
-                self._slip_guard_active = True
-                correction *= SLIP_COMMAND_SCALE
-                target *= SLIP_COMMAND_SCALE
             adjusted[name] = _clamp(target + correction)
 
         return adjusted, feedback_values
@@ -1616,7 +1569,6 @@ def main() -> None:
         f"input_slew={INPUT_SLEW_RATE:.2f}/{INPUT_DECEL_SLEW_RATE:.2f} "
         f"wheel_slew={WHEEL_COMMAND_SLEW_RATE:.2f}/{WHEEL_COMMAND_DECEL_RATE:.2f} "
         f"rot_mix={ROTATION_WHEEL_GAIN:.2f} "
-        f"idle_hold={'ON' if IDLE_HOLD_ENABLE else 'OFF'} "
         f"min_send={MOTOR_MIN_SEND_INTERVAL:.3f}s "
         f"zero_hold={MOTOR_ZERO_HOLD_BAND:.2f}"
     )
@@ -1626,7 +1578,6 @@ def main() -> None:
         f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
         f"limit={PID_OUTPUT_LIMIT:.2f} "
         f"corr_deadband={PID_CORRECTION_DEADBAND:.2f} "
-        f"slip_guard={'ON' if SLIP_GUARD_ENABLE else 'OFF'} "
         f"source={PID_FEEDBACK_SOURCE} "
         f"encoder_frame={EDULITE05_ENCODER_FRAME} "
         f"encoder_format={EDULITE05_ENCODER_FORMAT}"
