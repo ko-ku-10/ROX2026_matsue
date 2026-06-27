@@ -293,23 +293,23 @@ DASHBOARD_HTML = r"""
 <script>
 const names=["FL","FR","RL","RR"];
 const corners={FL:"前左",FR:"前右",RL:"後左",RR:"後右"};
-const displaySign={FL:1,FR:-1,RL:1,RR:-1};
 const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):"--";
 const cls=(ok)=>ok?"status-ok":"status-warn";
 function kv(id, rows){document.getElementById(id).innerHTML=rows.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("");}
 function dirClass(v){return Math.abs(Number(v)||0)<0.03?"stop":(v>0?"fwd":"rev");}
 function dirText(v){return Math.abs(Number(v)||0)<0.03?"STOP":(v>0?"前":"後");}
-function wheelValue(n,wh,key){return Number((wh[key]||{})[n]||0)*(displaySign[n]||1);}
+function driveValue(inp){return -Number((inp||{}).vx||0);}
+function wheelValue(n,wh,key){return Number((wh[key]||{})[n]||0);}
 function biBar(label,value){const v=Number(value)||0;const pct=Math.min(50,Math.abs(v)*50);const sign=v>=0?"pos":"neg";return `<div class="barrow"><div class="label"><span>${label}</span><span class="num">${fmt(v,3)}</span></div><div class="bibar"><div class="fill ${sign}" style="width:${pct}%"></div></div></div>`;}
-function wheelCard(n,wh){const cmd=wheelValue(n,wh,'command');return `<div class="wheel wheel-${n}"><h3><span>${n}</span><span class="dir ${dirClass(cmd)}">${dirText(cmd)}</span></h3><div class="corner">${corners[n]}</div>${biBar('目標 raw',wheelValue(n,wh,'raw_target'))}${biBar('目標 slew',wheelValue(n,wh,'pid_target'))}${biBar('最終 command',cmd)}${biBar('実測 encoder',wheelValue(n,wh,'measured'))}${biBar('PID補正',wheelValue(n,wh,'pid_correction'))}<div class="encoder"><span>encoder value</span><span class="num">${fmt((wh.encoder||{})[n],0)}</span></div></div>`;}
-function chassis(inp){const x=Math.max(-1,Math.min(1,Number(inp.vy)||0))*58;const y=-Math.max(-1,Math.min(1,Number(inp.vx)||0))*58;const rot=Math.max(-1,Math.min(1,Number(inp.omega)||0))*135;return `<div class="chassis"><div class="bodybox"><div class="nose">FRONT</div><div class="vector"><div class="dot" style="transform:translate(${x}px,${y}px)"></div></div><div class="rot"><div class="needlebox"><div class="needle" style="transform:translate(-50%,-100%) rotate(${rot}deg)"></div></div><span>旋回 ${fmt(inp.omega,3)}</span></div></div></div>`;}
+function wheelCard(n,wh,inp){const cmd=wheelValue(n,wh,'command');const drive=driveValue(inp);return `<div class="wheel wheel-${n}"><h3><span>${n}</span><span class="dir ${dirClass(drive)}">${dirText(drive)}</span></h3><div class="corner">${corners[n]}</div>${biBar('目標 raw',wheelValue(n,wh,'raw_target'))}${biBar('目標 slew',wheelValue(n,wh,'pid_target'))}${biBar('最終 command',cmd)}${biBar('実測 encoder',wheelValue(n,wh,'measured'))}${biBar('PID補正',wheelValue(n,wh,'pid_correction'))}<div class="encoder"><span>encoder value</span><span class="num">${fmt((wh.encoder||{})[n],0)}</span></div></div>`;}
+function chassis(inp){const x=Math.max(-1,Math.min(1,Number(inp.vy)||0))*58;const y=Math.max(-1,Math.min(1,Number(inp.vx)||0))*58;const rot=Math.max(-1,Math.min(1,Number(inp.omega)||0))*135;return `<div class="chassis"><div class="bodybox"><div class="nose">FRONT</div><div class="vector"><div class="dot" style="transform:translate(${x}px,${y}px)"></div></div><div class="rot"><div class="needlebox"><div class="needle" style="transform:translate(-50%,-100%) rotate(${rot}deg)"></div></div><span>旋回 ${fmt(inp.omega,3)}</span></div></div></div>`;}
 function render(s){
   const now=Date.now()/1000; document.getElementById('age').textContent=fmt((now-(s.updated_at||now))*1000,0);
   const c=s.controller||{}, p=s.pid||{}, inp=s.input||{}, wh=s.wheels||{};
   kv('system',[["status",s.status||"--"],["controller",`<span class="${cls(c.connected)}">${c.connected?'connected':'waiting'}</span>`],["backend",c.backend||"--"],["loop",fmt(s.loop_hz,1)+" Hz"],["seq",s.seq||0]]);
   kv('input',[["vx",fmt(inp.vx,3)],["vy",fmt(inp.vy,3)],["omega",fmt(inp.omega,3)],["idle",inp.idle?"yes":"no"]]);
   kv('pid',[["enabled",p.enabled?"ON":"OFF"],["feedback",`<span class="${cls(p.feedback_ok)}">${p.feedback_ok?'OK':'none'}</span>`],["kp/ki/kd",`${fmt(p.kp,3)} / ${fmt(p.ki,3)} / ${fmt(p.kd,3)}`],["limit",fmt(p.output_limit,2)]]);
-  document.getElementById('robot').innerHTML=wheelCard('FL',wh)+chassis(inp)+wheelCard('FR',wh)+wheelCard('RL',wh)+wheelCard('RR',wh);
+  document.getElementById('robot').innerHTML=wheelCard('FL',wh,inp)+chassis(inp)+wheelCard('FR',wh,inp)+wheelCard('RL',wh,inp)+wheelCard('RR',wh,inp);
 }
 const es=new EventSource('/events');
 es.onmessage=(ev)=>render(JSON.parse(ev.data));
