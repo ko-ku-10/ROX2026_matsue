@@ -148,10 +148,10 @@ DEBUG_ENCODER = _env_flag("DEBUG_ENCODER", "1")
 
 # PID速度制御（フィードバック速度が取れる場合のみ有効化する）
 PID_ENABLE = _env_flag("PID_ENABLE", "1")
-PID_KP = float(os.getenv("PID_KP", "0.35"))
+PID_KP = float(os.getenv("PID_KP", "0.08"))
 PID_KI = float(os.getenv("PID_KI", "0.0"))
 PID_KD = float(os.getenv("PID_KD", "0.0"))
-PID_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("PID_OUTPUT_LIMIT", "0.35"))))
+PID_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("PID_OUTPUT_LIMIT", "0.12"))))
 PID_INTEGRAL_LIMIT = max(0.0, float(os.getenv("PID_INTEGRAL_LIMIT", "0.5")))
 PID_FEEDBACK_SOURCE = os.getenv("PID_FEEDBACK_SOURCE", "edulite05_encoder").strip().lower()
 PID_FEEDBACK_FILE = os.getenv("PID_FEEDBACK_FILE", "").strip()
@@ -165,11 +165,13 @@ EDULITE05_ENCODER_REGISTER = int(os.getenv("EDULITE05_ENCODER_REGISTER", "0x7019
 EDULITE05_ENCODER_FORMAT = os.getenv("EDULITE05_ENCODER_FORMAT", "uint16").strip().lower()
 EDULITE05_ENCODER_VALUE_OFFSET = int(os.getenv("EDULITE05_ENCODER_VALUE_OFFSET", "0"))
 EDULITE05_ENCODER_COUNTS_PER_REV = max(1.0, float(os.getenv("EDULITE05_ENCODER_COUNTS_PER_REV", "65536")))
-EDULITE05_ENCODER_MAX_RPS = max(0.001, float(os.getenv("EDULITE05_ENCODER_MAX_RPS", "5.0")))
+EDULITE05_ENCODER_MAX_RPS = max(0.001, float(os.getenv("EDULITE05_ENCODER_MAX_RPS", "20.0")))
 EDULITE05_ENCODER_STALE_SEC = max(0.0, float(os.getenv("EDULITE05_ENCODER_STALE_SEC", "0.25")))
 EDULITE05_ENCODER_UNITS = os.getenv("EDULITE05_ENCODER_UNITS", "counts").strip().lower()
 EDULITE05_ENCODER_WRAP_RADIANS = _env_flag("EDULITE05_ENCODER_WRAP_RADIANS", "1")
 EDULITE05_ENCODER_FRAME = os.getenv("EDULITE05_ENCODER_FRAME", "status").strip().lower()
+EDULITE05_ENCODER_SPEED_FILTER_ALPHA = max(0.0, min(1.0, float(os.getenv("EDULITE05_ENCODER_SPEED_FILTER_ALPHA", "0.25"))))
+PID_CORRECTION_DEADBAND = max(0.0, min(1.0, float(os.getenv("PID_CORRECTION_DEADBAND", "0.12"))))
 
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
@@ -364,6 +366,7 @@ class EDULITE05EncoderFeedback:
         self._last_value: dict[str, float] = {}
         self._last_sample_at: dict[str, float] = {}
         self._speeds: dict[str, float] = {}
+        self._filtered_speeds: dict[str, float] = {}
         self._speed_updated_at: dict[str, float] = {}
 
     def read(self) -> dict[str, float] | None:
@@ -421,7 +424,12 @@ class EDULITE05EncoderFeedback:
         dt = now - last_at
         if dt <= 0.0:
             return
-        self._speeds[name] = self._encoder_delta_to_speed(encoder_value - last_value, dt)
+        raw_speed = self._encoder_delta_to_speed(encoder_value - last_value, dt)
+        previous = self._filtered_speeds.get(name, raw_speed)
+        alpha = EDULITE05_ENCODER_SPEED_FILTER_ALPHA
+        filtered = raw_speed if alpha >= 1.0 else previous + alpha * (raw_speed - previous)
+        self._speeds[name] = filtered
+        self._filtered_speeds[name] = filtered
         self._speed_updated_at[name] = now
 
     def _motor_name(self, frame_type: int, can_id: int, motor_addr: int) -> str | None:
@@ -720,7 +728,7 @@ class MecanumDrive:
         self._lw = lw
         self._last_debug_at = 0.0
         self._last_pid_at = time.monotonic()
-        self._pid_started_at = self._last_pid_at
+        self._pid_started_at = 0.0
         self._pid_feedback_missing_logged = False
         self.pid_controllers = {
             name: PIDController(PID_KP, PID_KI, PID_KD, PID_OUTPUT_LIMIT, PID_INTEGRAL_LIMIT)
@@ -823,6 +831,8 @@ class MecanumDrive:
         self._last_pid_at = now
 
         if feedback_values is None:
+            if self._pid_started_at <= 0.0:
+                self._pid_started_at = now
             if not self._pid_feedback_missing_logged and now - self._pid_started_at >= 1.0:
                 self._pid_feedback_missing_logged = True
                 print("[WARN] PID_ENABLE=1 ですが有効なEDULITE05エンコーダ速度がありません。開ループ指令を送信します。")
@@ -841,6 +851,11 @@ class MecanumDrive:
             if PID_RESET_ON_STOP and abs(target) < COMMAND_DEADBAND:
                 pid.reset()
                 adjusted[name] = 0.0
+                continue
+
+            if abs(target) < PID_CORRECTION_DEADBAND:
+                pid.reset()
+                adjusted[name] = target
                 continue
 
             correction = pid.update(target, measured, dt)
@@ -1506,6 +1521,7 @@ def main() -> None:
         f"status={'ON' if PID_ENABLE else 'OFF'} "
         f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
         f"limit={PID_OUTPUT_LIMIT:.2f} "
+        f"corr_deadband={PID_CORRECTION_DEADBAND:.2f} "
         f"source={PID_FEEDBACK_SOURCE} "
         f"encoder_frame={EDULITE05_ENCODER_FRAME} "
         f"encoder_format={EDULITE05_ENCODER_FORMAT}"

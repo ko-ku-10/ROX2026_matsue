@@ -223,8 +223,8 @@ AT_SPEED_PERCENT=60 uv run python mecanum_rc.py
 
 ```bash
 PID_ENABLE=1 \
-PID_KP=0.35 PID_KI=0.0 PID_KD=0.0 \
-EDULITE05_ENCODER_MAX_RPS=5.0 \
+PID_KP=0.08 PID_KI=0.0 PID_KD=0.0 \
+EDULITE05_ENCODER_MAX_RPS=20.0 \
 uv run python mecanum_rc.py
 ```
 
@@ -232,11 +232,12 @@ uv run python mecanum_rc.py
 
 ```python
 PID_ENABLE = 0                 # 1でPID補正を有効化
-PID_KP = 0.35                  # 比例ゲイン
+PID_KP = 0.08                  # 比例ゲイン（最初は低め）
 PID_KI = 0.0                   # 積分ゲイン
 PID_KD = 0.0                   # 微分ゲイン
-PID_OUTPUT_LIMIT = 0.35        # PID補正量の上限
+PID_OUTPUT_LIMIT = 0.12        # PID補正量の上限
 PID_INTEGRAL_LIMIT = 0.5       # 積分項の上限
+PID_CORRECTION_DEADBAND = 0.12 # 小さい指令ではPID補正しない
 ```
 
 EDULITE05 エンコーダ読み取り設定:
@@ -248,7 +249,8 @@ EDULITE05_ENCODER_FORMAT = "uint16"         # ステータスデータ先頭2バ
 EDULITE05_ENCODER_VALUE_OFFSET = 0          # 応答データ内の値開始位置
 EDULITE05_ENCODER_UNITS = "counts"          # 角度カウント値として扱う
 EDULITE05_ENCODER_COUNTS_PER_REV = 65536    # 1回転あたりのカウント数
-EDULITE05_ENCODER_MAX_RPS = 5.0             # 正規化速度1.0に相当する回転数[rev/s]
+EDULITE05_ENCODER_MAX_RPS = 20.0            # 正規化速度1.0に相当する回転数[rev/s]
+EDULITE05_ENCODER_SPEED_FILTER_ALPHA = 0.25 # 速度フィードバックの平滑化
 EDULITE05_ENCODER_QUERY_INTERVAL = 0.02     # 読み取り周期[秒]
 EDULITE05_ENCODER_STALE_SEC = 0.25          # 古いエンコーダ値を無効化する秒数
 ```
