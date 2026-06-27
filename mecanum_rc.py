@@ -38,6 +38,7 @@ import serial
 import pygame
 import os
 import glob
+import json
 import time
 import sys
 import subprocess
@@ -142,6 +143,17 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 DEBUG_INPUT = _env_flag("DEBUG_INPUT", "1")
 
+# PID速度制御（フィードバック速度が取れる場合のみ有効化する）
+PID_ENABLE = _env_flag("PID_ENABLE", "0")
+PID_KP = float(os.getenv("PID_KP", "0.35"))
+PID_KI = float(os.getenv("PID_KI", "0.0"))
+PID_KD = float(os.getenv("PID_KD", "0.0"))
+PID_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("PID_OUTPUT_LIMIT", "0.35"))))
+PID_INTEGRAL_LIMIT = max(0.0, float(os.getenv("PID_INTEGRAL_LIMIT", "0.5")))
+PID_FEEDBACK_FILE = os.getenv("PID_FEEDBACK_FILE", "").strip()
+PID_FEEDBACK_STALE_SEC = max(0.0, float(os.getenv("PID_FEEDBACK_STALE_SEC", "0.25")))
+PID_RESET_ON_STOP = _env_flag("PID_RESET_ON_STOP", "1")
+
 # DualSense の MAC アドレスを指定
 DUALSENSE_MAC_ADDRESS = os.getenv("DUALSENSE_MAC_ADDRESS", "").strip()
 
@@ -200,6 +212,122 @@ def _build_velocity_cmd_value(motor_addr: int, at_value: int) -> bytes:
         0x08, 0x05, 0x70, 0x00, 0x00, 0x07, direction,
         (value >> 8) & 0xFF, value & 0xFF, 0x0D, 0x0A,
     ])
+
+
+# ============================================================
+# PID制御 / ホイール速度フィードバック
+# ============================================================
+
+WHEEL_NAMES = ("FL", "FR", "RL", "RR")
+
+
+def _clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+class PIDController:
+    """正規化速度 [-1, +1] を扱う単純な PID コントローラー"""
+
+    def __init__(self, kp: float, ki: float, kd: float, output_limit: float, integral_limit: float):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.output_limit = output_limit
+        self.integral_limit = integral_limit
+        self._integral = 0.0
+        self._last_error: float | None = None
+
+    def reset(self) -> None:
+        self._integral = 0.0
+        self._last_error = None
+
+    def update(self, target: float, measured: float, dt: float) -> float:
+        dt = max(0.001, dt)
+        error = target - measured
+        self._integral += error * dt
+        if self.integral_limit > 0.0:
+            self._integral = _clamp(self._integral, -self.integral_limit, self.integral_limit)
+
+        derivative = 0.0
+        if self._last_error is not None:
+            derivative = (error - self._last_error) / dt
+        self._last_error = error
+
+        correction = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
+        return _clamp(correction, -self.output_limit, self.output_limit)
+
+
+class WheelSpeedFeedback:
+    """外部プロセスが書くホイール速度ファイルを読み取る。
+
+    値は各ホイールの正規化速度 [-1, +1] として扱う。JSON なら
+    {"FL": 0.1, "FR": -0.1, "RL": 0.1, "RR": -0.1}、
+    テキストなら "FL=0.1 FR=-0.1 RL=0.1 RR=-0.1" または
+    "0.1,-0.1,0.1,-0.1" の順序で指定できる。
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path) if path else None
+        self._last_mtime_ns: int | None = None
+        self._values: dict[str, float] = {}
+
+    def read(self) -> dict[str, float] | None:
+        if self.path is None:
+            return None
+        try:
+            stat_result = self.path.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            print(f"[WARN] PIDフィードバックファイルを読めません: {e}")
+            return None
+
+        if PID_FEEDBACK_STALE_SEC > 0.0:
+            age = time.time() - stat_result.st_mtime
+            if age > PID_FEEDBACK_STALE_SEC:
+                return None
+
+        if self._last_mtime_ns != stat_result.st_mtime_ns:
+            try:
+                raw = self.path.read_text(encoding="utf-8").strip()
+                self._values = self._parse(raw)
+                self._last_mtime_ns = stat_result.st_mtime_ns
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                print(f"[WARN] PIDフィードバック値を解釈できません: {e}")
+                return None
+
+        return self._values or None
+
+    def _parse(self, raw: str) -> dict[str, float]:
+        if not raw:
+            return {}
+
+        if raw[0] in "[{":
+            data = json.loads(raw)
+            if isinstance(data, dict) and isinstance(data.get("wheel_speed"), dict):
+                data = data["wheel_speed"]
+            if not isinstance(data, dict):
+                raise ValueError("JSON はオブジェクト形式で指定してください")
+            return self._coerce_mapping(data)
+
+        normalized = raw.replace(",", " ").replace("\n", " ")
+        tokens = [token for token in normalized.split(" ") if token]
+        if tokens and all("=" in token for token in tokens):
+            pairs = [token.split("=", 1) for token in tokens]
+            return self._coerce_mapping({key: value for key, value in pairs})
+
+        values = [float(token) for token in tokens]
+        if len(values) != len(WHEEL_NAMES):
+            raise ValueError("CSV形式は FL,FR,RL,RR の4値で指定してください")
+        return {name: _clamp(value) for name, value in zip(WHEEL_NAMES, values)}
+
+    @staticmethod
+    def _coerce_mapping(data: dict) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for name in WHEEL_NAMES:
+            if name in data:
+                values[name] = _clamp(float(data[name]))
+        return values
 
 
 # ============================================================
@@ -381,6 +509,13 @@ class MecanumDrive:
         lw = WHEEL_BASE_HALF_L + WHEEL_BASE_HALF_W
         self._lw = lw
         self._last_debug_at = 0.0
+        self._last_pid_at = time.monotonic()
+        self._pid_feedback_missing_logged = False
+        self.pid_controllers = {
+            name: PIDController(PID_KP, PID_KI, PID_KD, PID_OUTPUT_LIMIT, PID_INTEGRAL_LIMIT)
+            for name in WHEEL_NAMES
+        } if PID_ENABLE else {}
+        self.feedback = WheelSpeedFeedback(PID_FEEDBACK_FILE) if PID_ENABLE else None
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -426,22 +561,80 @@ class MecanumDrive:
         rl_out = rl
         rr_out = -rr
 
-        self.motors["FL"].set_velocity(fl_out)
-        self.motors["FR"].set_velocity(fr_out)
-        self.motors["RL"].set_velocity(rl_out)
-        self.motors["RR"].set_velocity(rr_out)
+        wheel_targets = {
+            "FL": fl_out,
+            "FR": fr_out,
+            "RL": rl_out,
+            "RR": rr_out,
+        }
+        feedback_values = None
+        if PID_ENABLE:
+            wheel_targets, feedback_values = self._apply_pid(wheel_targets)
+
+        self.motors["FL"].set_velocity(wheel_targets["FL"])
+        self.motors["FR"].set_velocity(wheel_targets["FR"])
+        self.motors["RL"].set_velocity(wheel_targets["RL"])
+        self.motors["RR"].set_velocity(wheel_targets["RR"])
 
         if DEBUG_INPUT:
             now = time.monotonic()
             if now - self._last_debug_at >= 1.0:
                 self._last_debug_at = now
+                pid_text = ""
+                if PID_ENABLE and feedback_values is not None:
+                    pid_text = (
+                        " | PID measured "
+                        f"FL={feedback_values.get('FL', 0.0):+.2f} "
+                        f"FR={feedback_values.get('FR', 0.0):+.2f} "
+                        f"RL={feedback_values.get('RL', 0.0):+.2f} "
+                        f"RR={feedback_values.get('RR', 0.0):+.2f}"
+                    )
                 print(
                     "[DEBUG] "
                     f"vx={vx:+.2f} vy={vy:+.2f} omega={omega:+.2f} "
-                    f"| FL={fl_out:+.2f} FR={fr_out:+.2f} RL={rl_out:+.2f} RR={rr_out:+.2f}"
+                    f"| FL={wheel_targets['FL']:+.2f} FR={wheel_targets['FR']:+.2f} "
+                    f"RL={wheel_targets['RL']:+.2f} RR={wheel_targets['RR']:+.2f}"
+                    f"{pid_text}"
                 )
 
+    def _apply_pid(self, targets: dict[str, float]) -> tuple[dict[str, float], dict[str, float] | None]:
+        if self.feedback is None:
+            return targets, None
+
+        feedback_values = self.feedback.read()
+        now = time.monotonic()
+        dt = now - self._last_pid_at
+        self._last_pid_at = now
+
+        if feedback_values is None:
+            if not self._pid_feedback_missing_logged:
+                self._pid_feedback_missing_logged = True
+                print("[WARN] PID_ENABLE=1 ですが有効な速度フィードバックがありません。開ループ指令を送信します。")
+            return targets, None
+
+        self._pid_feedback_missing_logged = False
+        adjusted: dict[str, float] = {}
+        for name in WHEEL_NAMES:
+            target = targets[name]
+            measured = feedback_values.get(name)
+            pid = self.pid_controllers[name]
+            if measured is None:
+                adjusted[name] = target
+                continue
+
+            if PID_RESET_ON_STOP and abs(target) < COMMAND_DEADBAND:
+                pid.reset()
+                adjusted[name] = 0.0
+                continue
+
+            correction = pid.update(target, measured, dt)
+            adjusted[name] = _clamp(target + correction)
+
+        return adjusted, feedback_values
+
     def stop(self) -> None:
+        for pid in self.pid_controllers.values():
+            pid.reset()
         for m in self.motors.values():
             m.stop()
 
@@ -1091,6 +1284,13 @@ def main() -> None:
         f"slew_rate={INPUT_SLEW_RATE:.2f} "
         f"min_send={MOTOR_MIN_SEND_INTERVAL:.3f}s "
         f"zero_hold={MOTOR_ZERO_HOLD_BAND:.2f}"
+    )
+    print(
+        "  [PID] "
+        f"status={'ON' if PID_ENABLE else 'OFF'} "
+        f"kp={PID_KP:.3f} ki={PID_KI:.3f} kd={PID_KD:.3f} "
+        f"limit={PID_OUTPUT_LIMIT:.2f} "
+        f"feedback_file={PID_FEEDBACK_FILE or '未設定'}"
     )
 
     try:

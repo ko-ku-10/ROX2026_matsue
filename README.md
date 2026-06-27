@@ -210,6 +210,42 @@ INPUT_SLEW_RATE = 0.0
 AT_SPEED_PERCENT=60 uv run python mecanum_rc.py
 ```
 
+
+---
+
+## 🧭 EDULITE05 で PID 速度制御を使う場合
+
+このブランチでは EDULITE05 へ送る速度指令の手前に PID 補正レイヤを追加しています。通常起動では従来どおり開ループ制御で動き、`PID_ENABLE=1` を指定した場合だけ PID が有効になります。
+
+重要: PID を閉ループとして動かすには、各 EDULITE05 の現在速度を読んで `PID_FEEDBACK_FILE` に書き出す処理が別途必要です。このサンプル本体には EDULITE05 から速度を読み出すレジスタ通信はまだ実装していません。フィードバックが無い場合は警告を出して従来の開ループ指令を送ります。
+
+フィードバックファイルは正規化ホイール速度 `-1.0`〜`+1.0` を `FL,FR,RL,RR` で渡します。
+
+```json
+{"FL": 0.10, "FR": -0.10, "RL": 0.10, "RR": -0.10}
+```
+
+起動例:
+
+```bash
+PID_ENABLE=1 \
+PID_FEEDBACK_FILE=/tmp/edulite05_wheel_speed.json \
+PID_KP=0.35 PID_KI=0.0 PID_KD=0.0 \
+uv run python mecanum_rc.py
+```
+
+主な PID パラメータ:
+
+```python
+PID_ENABLE = 0                 # 1でPID補正を有効化
+PID_KP = 0.35                  # 比例ゲイン
+PID_KI = 0.0                   # 積分ゲイン
+PID_KD = 0.0                   # 微分ゲイン
+PID_OUTPUT_LIMIT = 0.35        # PID補正量の上限
+PID_INTEGRAL_LIMIT = 0.5       # 積分項の上限
+PID_FEEDBACK_STALE_SEC = 0.25  # この秒数より古い実測値は無効
+```
+
 ---
 
 ## 🔌 接続先を変える場合
