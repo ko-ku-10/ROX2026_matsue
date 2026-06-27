@@ -293,13 +293,15 @@ DASHBOARD_HTML = r"""
 <script>
 const names=["FL","FR","RL","RR"];
 const corners={FL:"前左",FR:"前右",RL:"後左",RR:"後右"};
+const displaySign={FL:1,FR:-1,RL:1,RR:-1};
 const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):"--";
 const cls=(ok)=>ok?"status-ok":"status-warn";
 function kv(id, rows){document.getElementById(id).innerHTML=rows.map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join("");}
 function dirClass(v){return Math.abs(Number(v)||0)<0.03?"stop":(v>0?"fwd":"rev");}
-function dirText(v){return Math.abs(Number(v)||0)<0.03?"STOP":(v>0?"正転":"逆転");}
+function dirText(v){return Math.abs(Number(v)||0)<0.03?"STOP":(v>0?"前":"後");}
+function wheelValue(n,wh,key){return Number((wh[key]||{})[n]||0)*(displaySign[n]||1);}
 function biBar(label,value){const v=Number(value)||0;const pct=Math.min(50,Math.abs(v)*50);const sign=v>=0?"pos":"neg";return `<div class="barrow"><div class="label"><span>${label}</span><span class="num">${fmt(v,3)}</span></div><div class="bibar"><div class="fill ${sign}" style="width:${pct}%"></div></div></div>`;}
-function wheelCard(n,wh){const cmd=(wh.command||{})[n]||0;return `<div class="wheel wheel-${n}"><h3><span>${n}</span><span class="dir ${dirClass(cmd)}">${dirText(cmd)}</span></h3><div class="corner">${corners[n]}</div>${biBar('目標 raw',(wh.raw_target||{})[n])}${biBar('目標 slew',(wh.pid_target||{})[n])}${biBar('最終 command',cmd)}${biBar('実測 encoder',(wh.measured||{})[n])}${biBar('PID補正',(wh.pid_correction||{})[n])}<div class="encoder"><span>encoder value</span><span class="num">${fmt((wh.encoder||{})[n],0)}</span></div></div>`;}
+function wheelCard(n,wh){const cmd=wheelValue(n,wh,'command');return `<div class="wheel wheel-${n}"><h3><span>${n}</span><span class="dir ${dirClass(cmd)}">${dirText(cmd)}</span></h3><div class="corner">${corners[n]}</div>${biBar('目標 raw',wheelValue(n,wh,'raw_target'))}${biBar('目標 slew',wheelValue(n,wh,'pid_target'))}${biBar('最終 command',cmd)}${biBar('実測 encoder',wheelValue(n,wh,'measured'))}${biBar('PID補正',wheelValue(n,wh,'pid_correction'))}<div class="encoder"><span>encoder value</span><span class="num">${fmt((wh.encoder||{})[n],0)}</span></div></div>`;}
 function chassis(inp){const x=Math.max(-1,Math.min(1,Number(inp.vy)||0))*58;const y=-Math.max(-1,Math.min(1,Number(inp.vx)||0))*58;const rot=Math.max(-1,Math.min(1,Number(inp.omega)||0))*135;return `<div class="chassis"><div class="bodybox"><div class="nose">FRONT</div><div class="vector"><div class="dot" style="transform:translate(${x}px,${y}px)"></div></div><div class="rot"><div class="needlebox"><div class="needle" style="transform:translate(-50%,-100%) rotate(${rot}deg)"></div></div><span>旋回 ${fmt(inp.omega,3)}</span></div></div></div>`;}
 function render(s){
   const now=Date.now()/1000; document.getElementById('age').textContent=fmt((now-(s.updated_at||now))*1000,0);
