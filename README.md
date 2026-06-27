@@ -255,6 +255,13 @@ WHEEL_COMMAND_SLEW_RATE = 1.5       # ホイール指令の急変を抑える
 SLIP_GUARD_ENABLE = 1             # 滑り防止の指令抑制を有効化
 SLIP_SPEED_ERROR_THRESHOLD = 0.35  # 指令と実測の差が大きい時に滑り扱い
 SLIP_COMMAND_SCALE = 0.75          # 滑り検知時の指令倍率
+ROTATION_WHEEL_GAIN = 3.0         # 旋回時のホイール寄与倍率
+INPUT_DECEL_SLEW_RATE = 4.0      # スティックを戻した時の減速レート
+WHEEL_COMMAND_DECEL_RATE = 6.0   # ホイール指令の減速レート
+IDLE_HOLD_ENABLE = 1             # スティック中立時に位置保持
+IDLE_HOLD_POSITION_KP = 1.4      # 中立保持の位置ずれ補正
+IDLE_HOLD_DAMPING_KP = 0.25      # 中立保持の速度制動
+IDLE_HOLD_OUTPUT_LIMIT = 0.25    # 中立保持の最大出力
 EDULITE05_ENCODER_QUERY_INTERVAL = 0.02     # 読み取り周期[秒]
 EDULITE05_ENCODER_STALE_SEC = 0.25          # 古いエンコーダ値を無効化する秒数
 ```

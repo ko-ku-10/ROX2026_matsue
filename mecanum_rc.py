@@ -119,6 +119,15 @@ ROTATION_GAIN = float(os.getenv("ROTATION_GAIN", "1.0"))
 INPUT_CURVE_EXPONENT = float(os.getenv("INPUT_CURVE_EXPONENT", "1.0"))
 # 1秒あたりに変化できる最大量（0で無効）
 INPUT_SLEW_RATE = float(os.getenv("INPUT_SLEW_RATE", "1.2"))
+INPUT_DECEL_SLEW_RATE = float(os.getenv("INPUT_DECEL_SLEW_RATE", "4.0"))
+ROTATION_WHEEL_GAIN = float(os.getenv("ROTATION_WHEEL_GAIN", "3.0"))
+IDLE_COMMAND_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_COMMAND_DEADBAND", "0.08"))))
+IDLE_HOLD_ENABLE = os.getenv("IDLE_HOLD_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on", "y"}
+IDLE_HOLD_POSITION_KP = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_KP", "1.4")))
+IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.25")))
+IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.25"))))
+IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.02"))))
+IDLE_HOLD_POSITION_DEADBAND_REV = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_DEADBAND_REV", "0.003")))
 # ニュートラル近傍は0指令へ吸着（方向反転のチャタリング抑制）
 MOTOR_ZERO_HOLD_BAND = float(os.getenv("MOTOR_ZERO_HOLD_BAND", "0.06"))
 MOTOR_ZERO_HOLD_BAND = max(0.0, min(1.0, MOTOR_ZERO_HOLD_BAND))
@@ -173,6 +182,7 @@ EDULITE05_ENCODER_FRAME = os.getenv("EDULITE05_ENCODER_FRAME", "status").strip()
 EDULITE05_ENCODER_SPEED_FILTER_ALPHA = max(0.0, min(1.0, float(os.getenv("EDULITE05_ENCODER_SPEED_FILTER_ALPHA", "0.25"))))
 PID_CORRECTION_DEADBAND = max(0.0, min(1.0, float(os.getenv("PID_CORRECTION_DEADBAND", "0.12"))))
 WHEEL_COMMAND_SLEW_RATE = max(0.0, float(os.getenv("WHEEL_COMMAND_SLEW_RATE", "1.5")))
+WHEEL_COMMAND_DECEL_RATE = max(0.0, float(os.getenv("WHEEL_COMMAND_DECEL_RATE", "6.0")))
 SLIP_GUARD_ENABLE = _env_flag("SLIP_GUARD_ENABLE", "1")
 SLIP_SPEED_ERROR_THRESHOLD = max(0.0, min(1.0, float(os.getenv("SLIP_SPEED_ERROR_THRESHOLD", "0.35"))))
 SLIP_COMMAND_SCALE = max(0.0, min(1.0, float(os.getenv("SLIP_COMMAND_SCALE", "0.75"))))
@@ -484,7 +494,10 @@ class EDULITE05EncoderFeedback:
         except (struct.error, ValueError):
             return None
 
-    def _encoder_delta_to_speed(self, delta: float, dt: float) -> float:
+    def current_values(self) -> dict[str, float]:
+        return dict(self._last_value)
+
+    def encoder_delta_to_revolutions(self, delta: float) -> float:
         if EDULITE05_ENCODER_UNITS == "radians":
             if EDULITE05_ENCODER_WRAP_RADIANS:
                 wrap_threshold = 4.0
@@ -492,16 +505,19 @@ class EDULITE05EncoderFeedback:
                     delta -= 6.283185307179586
                 elif delta < -wrap_threshold:
                     delta += 6.283185307179586
-            rps = (delta / 6.283185307179586) / dt
-        elif EDULITE05_ENCODER_UNITS == "revolutions":
-            rps = delta / dt
-        else:
-            half_cpr = EDULITE05_ENCODER_COUNTS_PER_REV / 2.0
-            if delta > half_cpr:
-                delta -= EDULITE05_ENCODER_COUNTS_PER_REV
-            elif delta < -half_cpr:
-                delta += EDULITE05_ENCODER_COUNTS_PER_REV
-            rps = (delta / EDULITE05_ENCODER_COUNTS_PER_REV) / dt
+            return delta / 6.283185307179586
+        if EDULITE05_ENCODER_UNITS == "revolutions":
+            return delta
+
+        half_cpr = EDULITE05_ENCODER_COUNTS_PER_REV / 2.0
+        if delta > half_cpr:
+            delta -= EDULITE05_ENCODER_COUNTS_PER_REV
+        elif delta < -half_cpr:
+            delta += EDULITE05_ENCODER_COUNTS_PER_REV
+        return delta / EDULITE05_ENCODER_COUNTS_PER_REV
+
+    def _encoder_delta_to_speed(self, delta: float, dt: float) -> float:
+        rps = self.encoder_delta_to_revolutions(delta) / dt
         return _clamp(rps / EDULITE05_ENCODER_MAX_RPS)
 
 
@@ -747,6 +763,8 @@ class MecanumDrive:
         self._last_wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
         self._last_wheel_target_at = time.monotonic()
         self._slip_guard_active = False
+        self._idle_active = False
+        self._idle_hold_anchor: dict[str, float] = {}
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -770,12 +788,12 @@ class MecanumDrive:
         vy    : 左右 [-1, +1]  (+1 = 右ストレーフ)
         omega : 旋回 [-1, +1]  (+1 = 右旋回)
         """
-        lw = self._lw
+        rotation_mix = self._lw * ROTATION_WHEEL_GAIN
 
-        fl = vx - vy - lw * omega
-        fr = vx + vy + lw * omega
-        rl = vx + vy - lw * omega
-        rr = vx - vy + lw * omega
+        fl = vx - vy - rotation_mix * omega
+        fr = vx + vy + rotation_mix * omega
+        rl = vx + vy - rotation_mix * omega
+        rr = vx - vy + rotation_mix * omega
 
         # 最大値で正規化 (|値| > 1 にならないよう)
         max_val = max(abs(fl), abs(fr), abs(rl), abs(rr))
@@ -798,10 +816,25 @@ class MecanumDrive:
             "RL": rl_out,
             "RR": rr_out,
         }
-        wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
+        operator_idle = max(abs(vx), abs(vy), abs(omega)) < IDLE_COMMAND_DEADBAND
         feedback_values = None
-        if PID_ENABLE:
-            wheel_targets, feedback_values = self._apply_pid(wheel_targets)
+        if operator_idle:
+            self._idle_active = True
+            for pid in self.pid_controllers.values():
+                pid.reset()
+            if IDLE_HOLD_ENABLE and PID_ENABLE and self.feedback is not None:
+                feedback_values = self.feedback.read()
+                wheel_targets = self._apply_idle_hold(feedback_values)
+            else:
+                wheel_targets = {name: 0.0 for name in WHEEL_NAMES}
+            self._last_wheel_targets = dict(wheel_targets)
+            self._last_wheel_target_at = time.monotonic()
+        else:
+            self._idle_active = False
+            self._idle_hold_anchor = {}
+            wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
+            if PID_ENABLE:
+                wheel_targets, feedback_values = self._apply_pid(wheel_targets)
 
         self.motors["FL"].set_velocity(wheel_targets["FL"])
         self.motors["FR"].set_velocity(wheel_targets["FR"])
@@ -812,11 +845,13 @@ class MecanumDrive:
             now = time.monotonic()
             if now - self._last_debug_at >= 1.0:
                 self._last_debug_at = now
-                pid_text = ""
+                pid_text = " | idle=ON" if self._idle_active else ""
+                if self._idle_active and feedback_values is not None:
+                    pid_text += " hold=ON"
                 if PID_ENABLE and feedback_values is not None:
                     slip_text = " slip_guard=ON" if self._slip_guard_active else ""
                     self._slip_guard_active = False
-                    pid_text = (
+                    measured_text = (
                         " | PID measured "
                         f"FL={feedback_values.get('FL', 0.0):+.2f} "
                         f"FR={feedback_values.get('FR', 0.0):+.2f} "
@@ -824,6 +859,7 @@ class MecanumDrive:
                         f"RR={feedback_values.get('RR', 0.0):+.2f}"
                         f"{slip_text}"
                     )
+                    pid_text += measured_text
                 print(
                     "[DEBUG] "
                     f"vx={vx:+.2f} vy={vy:+.2f} omega={omega:+.2f} "
@@ -831,6 +867,32 @@ class MecanumDrive:
                     f"RL={wheel_targets['RL']:+.2f} RR={wheel_targets['RR']:+.2f}"
                     f"{pid_text}"
                 )
+
+    def _apply_idle_hold(self, feedback_values: dict[str, float] | None) -> dict[str, float]:
+        if not feedback_values:
+            return {name: 0.0 for name in WHEEL_NAMES}
+
+        encoder_values = {}
+        if hasattr(self.feedback, "current_values"):
+            encoder_values = self.feedback.current_values()
+        if encoder_values and not self._idle_hold_anchor:
+            self._idle_hold_anchor = dict(encoder_values)
+
+        hold_targets: dict[str, float] = {}
+        for name in WHEEL_NAMES:
+            measured_speed = feedback_values.get(name, 0.0)
+            damping = 0.0 if abs(measured_speed) < IDLE_HOLD_SPEED_DEADBAND else measured_speed
+            position_error_rev = 0.0
+            if encoder_values and name in encoder_values and name in self._idle_hold_anchor:
+                raw_error = encoder_values[name] - self._idle_hold_anchor[name]
+                if hasattr(self.feedback, "encoder_delta_to_revolutions"):
+                    position_error_rev = self.feedback.encoder_delta_to_revolutions(raw_error)
+                if abs(position_error_rev) < IDLE_HOLD_POSITION_DEADBAND_REV:
+                    position_error_rev = 0.0
+
+            command = -(IDLE_HOLD_POSITION_KP * position_error_rev) - (IDLE_HOLD_DAMPING_KP * damping)
+            hold_targets[name] = _clamp(command, -IDLE_HOLD_OUTPUT_LIMIT, IDLE_HOLD_OUTPUT_LIMIT)
+        return hold_targets
 
     def _apply_wheel_slew_limit(self, targets: dict[str, float]) -> dict[str, float]:
         if WHEEL_COMMAND_SLEW_RATE <= 0.0:
@@ -841,11 +903,14 @@ class MecanumDrive:
         now = time.monotonic()
         dt = max(0.001, now - self._last_wheel_target_at)
         self._last_wheel_target_at = now
-        max_delta = WHEEL_COMMAND_SLEW_RATE * dt
         limited: dict[str, float] = {}
         for name in WHEEL_NAMES:
             previous = self._last_wheel_targets.get(name, 0.0)
             target = targets[name]
+            rate = WHEEL_COMMAND_SLEW_RATE
+            if abs(target) < abs(previous) or previous * target < 0.0:
+                rate = WHEEL_COMMAND_DECEL_RATE
+            max_delta = rate * dt
             delta = target - previous
             if delta > max_delta:
                 target = previous + max_delta
@@ -1448,9 +1513,11 @@ class DualSenseController:
         now = time.monotonic()
         dt = max(0.001, now - self._last_read_at)
         self._last_read_at = now
-        max_delta = INPUT_SLEW_RATE * dt
-
         def limit_step(current: float, target: float) -> float:
+            rate = INPUT_SLEW_RATE
+            if abs(target) < abs(current) or current * target < 0.0:
+                rate = INPUT_DECEL_SLEW_RATE
+            max_delta = rate * dt
             delta = target - current
             if delta > max_delta:
                 return current + max_delta
@@ -1550,8 +1617,10 @@ def main() -> None:
         f"translation_gain={TRANSLATION_GAIN:.2f} "
         f"rotation_gain={ROTATION_GAIN:.2f} "
         f"curve_exp={INPUT_CURVE_EXPONENT:.2f} "
-        f"input_slew={INPUT_SLEW_RATE:.2f} "
-        f"wheel_slew={WHEEL_COMMAND_SLEW_RATE:.2f} "
+        f"input_slew={INPUT_SLEW_RATE:.2f}/{INPUT_DECEL_SLEW_RATE:.2f} "
+        f"wheel_slew={WHEEL_COMMAND_SLEW_RATE:.2f}/{WHEEL_COMMAND_DECEL_RATE:.2f} "
+        f"rot_mix={ROTATION_WHEEL_GAIN:.2f} "
+        f"idle_hold={'ON' if IDLE_HOLD_ENABLE else 'OFF'} "
         f"min_send={MOTOR_MIN_SEND_INTERVAL:.3f}s "
         f"zero_hold={MOTOR_ZERO_HOLD_BAND:.2f}"
     )
