@@ -123,11 +123,13 @@ INPUT_DECEL_SLEW_RATE = float(os.getenv("INPUT_DECEL_SLEW_RATE", "4.0"))
 ROTATION_WHEEL_GAIN = float(os.getenv("ROTATION_WHEEL_GAIN", "3.0"))
 IDLE_COMMAND_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_COMMAND_DEADBAND", "0.08"))))
 IDLE_HOLD_ENABLE = os.getenv("IDLE_HOLD_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on", "y"}
-IDLE_HOLD_POSITION_KP = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_KP", "1.4")))
-IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.25")))
-IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.25"))))
-IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.02"))))
+IDLE_HOLD_POSITION_KP = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_KP", "0.0")))
+IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.12")))
+IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.08"))))
+IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.08"))))
 IDLE_HOLD_POSITION_DEADBAND_REV = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_DEADBAND_REV", "0.003")))
+IDLE_HOLD_MAX_SPEED = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_MAX_SPEED", "0.45"))))
+IDLE_HOLD_RELEASE_SEC = max(0.0, float(os.getenv("IDLE_HOLD_RELEASE_SEC", "0.8")))
 # ニュートラル近傍は0指令へ吸着（方向反転のチャタリング抑制）
 MOTOR_ZERO_HOLD_BAND = float(os.getenv("MOTOR_ZERO_HOLD_BAND", "0.06"))
 MOTOR_ZERO_HOLD_BAND = max(0.0, min(1.0, MOTOR_ZERO_HOLD_BAND))
@@ -765,6 +767,7 @@ class MecanumDrive:
         self._slip_guard_active = False
         self._idle_active = False
         self._idle_hold_anchor: dict[str, float] = {}
+        self._idle_hold_release_until = 0.0
 
     def enable_all(self) -> None:
         for _ in range(ENABLE_RETRY_COUNT):
@@ -832,6 +835,7 @@ class MecanumDrive:
         else:
             self._idle_active = False
             self._idle_hold_anchor = {}
+            self._idle_hold_release_until = time.monotonic() + IDLE_HOLD_RELEASE_SEC
             wheel_targets = self._apply_wheel_slew_limit(wheel_targets)
             if PID_ENABLE:
                 wheel_targets, feedback_values = self._apply_pid(wheel_targets)
@@ -869,28 +873,19 @@ class MecanumDrive:
                 )
 
     def _apply_idle_hold(self, feedback_values: dict[str, float] | None) -> dict[str, float]:
-        if not feedback_values:
+        now = time.monotonic()
+        if now < self._idle_hold_release_until or not feedback_values:
             return {name: 0.0 for name in WHEEL_NAMES}
-
-        encoder_values = {}
-        if hasattr(self.feedback, "current_values"):
-            encoder_values = self.feedback.current_values()
-        if encoder_values and not self._idle_hold_anchor:
-            self._idle_hold_anchor = dict(encoder_values)
 
         hold_targets: dict[str, float] = {}
         for name in WHEEL_NAMES:
             measured_speed = feedback_values.get(name, 0.0)
-            damping = 0.0 if abs(measured_speed) < IDLE_HOLD_SPEED_DEADBAND else measured_speed
-            position_error_rev = 0.0
-            if encoder_values and name in encoder_values and name in self._idle_hold_anchor:
-                raw_error = encoder_values[name] - self._idle_hold_anchor[name]
-                if hasattr(self.feedback, "encoder_delta_to_revolutions"):
-                    position_error_rev = self.feedback.encoder_delta_to_revolutions(raw_error)
-                if abs(position_error_rev) < IDLE_HOLD_POSITION_DEADBAND_REV:
-                    position_error_rev = 0.0
+            abs_speed = abs(measured_speed)
+            if abs_speed < IDLE_HOLD_SPEED_DEADBAND or abs_speed > IDLE_HOLD_MAX_SPEED:
+                hold_targets[name] = 0.0
+                continue
 
-            command = -(IDLE_HOLD_POSITION_KP * position_error_rev) - (IDLE_HOLD_DAMPING_KP * damping)
+            command = -IDLE_HOLD_DAMPING_KP * measured_speed
             hold_targets[name] = _clamp(command, -IDLE_HOLD_OUTPUT_LIMIT, IDLE_HOLD_OUTPUT_LIMIT)
         return hold_targets
 
