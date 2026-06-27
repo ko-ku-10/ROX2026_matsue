@@ -260,10 +260,10 @@ INPUT_DECEL_SLEW_RATE = 4.0      # スティックを戻した時の減速レー
 WHEEL_COMMAND_DECEL_RATE = 6.0   # ホイール指令の減速レート
 IDLE_HOLD_ENABLE = 1             # スティック中立時に位置保持
 IDLE_HOLD_POSITION_KP = 0.0      # 位置戻しは無効（暴れ防止）
-IDLE_HOLD_DAMPING_KP = 0.12      # 中立保持の速度制動
-IDLE_HOLD_OUTPUT_LIMIT = 0.08    # 中立保持の最大出力
-IDLE_HOLD_MAX_SPEED = 0.45        # 大きく動いた時は保持出力を出さない
-IDLE_HOLD_RELEASE_SEC = 0.8      # 操作後すぐは保持を休ませる
+IDLE_HOLD_DAMPING_KP = 0.24      # 中立保持の速度制動
+IDLE_HOLD_OUTPUT_LIMIT = 0.18    # 中立保持の最大出力
+IDLE_HOLD_MAX_SPEED = 1.00       # 押されても速度を丸めて制動を続ける
+IDLE_HOLD_RELEASE_SEC = 0.2      # 操作後すぐは短時間だけ保持を休ませる
 EDULITE05_ENCODER_QUERY_INTERVAL = 0.02     # 読み取り周期[秒]
 EDULITE05_ENCODER_STALE_SEC = 0.25          # 古いエンコーダ値を無効化する秒数
 ```

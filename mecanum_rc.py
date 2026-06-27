@@ -124,12 +124,12 @@ ROTATION_WHEEL_GAIN = float(os.getenv("ROTATION_WHEEL_GAIN", "3.0"))
 IDLE_COMMAND_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_COMMAND_DEADBAND", "0.08"))))
 IDLE_HOLD_ENABLE = os.getenv("IDLE_HOLD_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on", "y"}
 IDLE_HOLD_POSITION_KP = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_KP", "0.0")))
-IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.12")))
-IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.08"))))
-IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.08"))))
+IDLE_HOLD_DAMPING_KP = max(0.0, float(os.getenv("IDLE_HOLD_DAMPING_KP", "0.24")))
+IDLE_HOLD_OUTPUT_LIMIT = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_OUTPUT_LIMIT", "0.18"))))
+IDLE_HOLD_SPEED_DEADBAND = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_SPEED_DEADBAND", "0.04"))))
 IDLE_HOLD_POSITION_DEADBAND_REV = max(0.0, float(os.getenv("IDLE_HOLD_POSITION_DEADBAND_REV", "0.003")))
-IDLE_HOLD_MAX_SPEED = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_MAX_SPEED", "0.45"))))
-IDLE_HOLD_RELEASE_SEC = max(0.0, float(os.getenv("IDLE_HOLD_RELEASE_SEC", "0.8")))
+IDLE_HOLD_MAX_SPEED = max(0.0, min(1.0, float(os.getenv("IDLE_HOLD_MAX_SPEED", "1.00"))))
+IDLE_HOLD_RELEASE_SEC = max(0.0, float(os.getenv("IDLE_HOLD_RELEASE_SEC", "0.2")))
 # ニュートラル近傍は0指令へ吸着（方向反転のチャタリング抑制）
 MOTOR_ZERO_HOLD_BAND = float(os.getenv("MOTOR_ZERO_HOLD_BAND", "0.06"))
 MOTOR_ZERO_HOLD_BAND = max(0.0, min(1.0, MOTOR_ZERO_HOLD_BAND))
@@ -881,11 +881,12 @@ class MecanumDrive:
         for name in WHEEL_NAMES:
             measured_speed = feedback_values.get(name, 0.0)
             abs_speed = abs(measured_speed)
-            if abs_speed < IDLE_HOLD_SPEED_DEADBAND or abs_speed > IDLE_HOLD_MAX_SPEED:
+            if abs_speed < IDLE_HOLD_SPEED_DEADBAND:
                 hold_targets[name] = 0.0
                 continue
 
-            command = -IDLE_HOLD_DAMPING_KP * measured_speed
+            limited_speed = _clamp(measured_speed, -IDLE_HOLD_MAX_SPEED, IDLE_HOLD_MAX_SPEED)
+            command = -IDLE_HOLD_DAMPING_KP * limited_speed
             hold_targets[name] = _clamp(command, -IDLE_HOLD_OUTPUT_LIMIT, IDLE_HOLD_OUTPUT_LIMIT)
         return hold_targets
 
