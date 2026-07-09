@@ -16,7 +16,7 @@ disp = libsrcampy.Display()
 disp.display(0, cam_width, cam_height)
 
 cam = libsrcampy.Camera()
-ret = cam.open_cam(0, -1, 30, cam_width, cam_height)
+ret = cam.open_cam(0, -1, 30, 1920, 1080)
 if ret:
     print("【エラー】カメラのオープンに失敗しました。")
     sys.exit(1)
