@@ -1,41 +1,40 @@
-"""AprilTag 検出器 (TagDetector)
+"""AprilTag 読み取りライブラリ。
 
-カメラ入力から AprilTag を検出し、各タグの推定位置を継続的に保持します。
-実機用の `hobot_vio.libsrcampy` を優先し、無ければ OpenCV `VideoCapture` を使います。
+カメラから AprilTag を継続的に検出し、最新のタグ一覧と
+既存コード互換の単一 pose JSON を取り出せるようにします。
 """
 from __future__ import annotations
 
-import time
-import threading
-import json
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Optional
+import json
+import threading
+import time
 
-import numpy as np
 import cv2
+import numpy as np
 
 try:
     from hobot_vio import libsrcampy
-except Exception:
+except Exception:  # pragma: no cover - SDK is optional in development environments
     libsrcampy = None
 
 
-class TagDetector:
-    """AprilTag を検出して最新のタグリストを保持するシンプルなクラス。
+DEFAULT_WIDTH = 1920
+DEFAULT_HEIGHT = 1080
+DEFAULT_MARKER_LENGTH_M = 0.10
+DEFAULT_FOCAL_LENGTH = 960.0
 
-    メソッド:
-    - start(): 背景スレッドを開始
-    - stop(): 停止
-    - get_latest_tags(): 最新の検出リストを取得
-    - write_pose_file(path): 最新検出を JSON で書き出す
-    """
+
+class TagDetector:
+    """AprilTag を背景スレッドで検出する。"""
 
     def __init__(
         self,
         camera_index: int = 0,
-        width: int = 1920,
-        height: int = 1080,
-        marker_length_m: float = 0.10,
+        width: int = DEFAULT_WIDTH,
+        height: int = DEFAULT_HEIGHT,
+        marker_length_m: float = DEFAULT_MARKER_LENGTH_M,
         camera_matrix: Optional[np.ndarray] = None,
         dist_coeffs: Optional[np.ndarray] = None,
     ) -> None:
@@ -43,82 +42,94 @@ class TagDetector:
         self.width = width
         self.height = height
         self.marker_length = float(marker_length_m)
-
-        if camera_matrix is None:
-            focal = max(width, height) * 0.5
-            self.camera_matrix = np.array([[focal, 0, width / 2.0], [0, focal, height / 2.0], [0, 0, 1]], dtype=np.float32)
-        else:
-            self.camera_matrix = camera_matrix
-
-        if dist_coeffs is None:
-            self.dist_coeffs = np.zeros((5, 1), dtype=np.float32)
-        else:
-            self.dist_coeffs = dist_coeffs
-
-        self._detector = cv2.aruco.ArucoDetector(
+        self.camera_matrix = camera_matrix if camera_matrix is not None else np.array(
+            [
+                [DEFAULT_FOCAL_LENGTH, 0, width / 2.0],
+                [0, DEFAULT_FOCAL_LENGTH, height / 2.0],
+                [0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        self.dist_coeffs = dist_coeffs if dist_coeffs is not None else np.zeros((5, 1), dtype=np.float32)
+        self.detector = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_16h5),
-            cv2.aruco.DetectorParameters()
+            cv2.aruco.DetectorParameters(),
+        )
+        marker_half = self.marker_length / 2.0
+        self._obj_points = np.array(
+            [
+                [-marker_half, marker_half, 0.0],
+                [marker_half, marker_half, 0.0],
+                [marker_half, -marker_half, 0.0],
+                [-marker_half, -marker_half, 0.0],
+            ],
+            dtype=np.float32,
         )
 
-        # object points for solvePnP (marker corners in marker frame)
-        m = self.marker_length / 2.0
-        self._obj_points = np.array([[-m, m, 0.0], [m, m, 0.0], [m, -m, 0.0], [-m, -m, 0.0]], dtype=np.float32)
-
-        self._latest: List[Dict] = []
+        self._latest_tags: list[dict] = []
+        self._latest_pose: dict[str, float] = {
+            "detected": False,
+            "id": None,
+            "x": 0.0,
+            "z": 0.0,
+            "updated_at": 0.0,
+        }
         self._lock = threading.Lock()
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
+        self._camera = None
+        self._display = None
+        self._use_libsrcampy = False
 
-        # camera pipeline
-        self._cap = None
-        self._use_libsrc = False
-
-    def _open_camera(self):
+    def _open_camera(self) -> None:
         if libsrcampy is not None:
             try:
-                disp = libsrcampy.Display()
-                disp.display(0, self.width, self.height)
-                cam = libsrcampy.Camera()
-                if cam.open_cam(self.camera_index, -1, 30, self.width, self.height):
-                    cam = None
+                display = libsrcampy.Display()
+                display.display(0, self.width, self.height)
+                camera = libsrcampy.Camera()
+                if camera.open_cam(self.camera_index, -1, 30, self.width, self.height):
+                    camera = None
                 else:
-                    libsrcampy.bind(cam, disp)
-                    self._cap = (cam, disp)
-                    self._use_libsrc = True
+                    libsrcampy.bind(camera, display)
+                    self._camera = camera
+                    self._display = display
+                    self._use_libsrcampy = True
                     return
             except Exception:
-                self._cap = None
+                self._camera = None
+                self._display = None
+                self._use_libsrcampy = False
 
-        # fallback to OpenCV VideoCapture
         try:
-            cap = cv2.VideoCapture(self.camera_index)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            if cap.isOpened():
-                self._cap = cap
-                self._use_libsrc = False
+            camera = cv2.VideoCapture(self.camera_index)
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            if camera.isOpened():
+                self._camera = camera
+                self._use_libsrcampy = False
             else:
-                self._cap = None
+                self._camera = None
         except Exception:
-            self._cap = None
+            self._camera = None
 
-    def _close_camera(self):
-        if self._cap is None:
+    def _close_camera(self) -> None:
+        if self._camera is None:
             return
-        if self._use_libsrc:
-            cam, disp = self._cap
+        if self._use_libsrcampy:
             try:
-                libsrcampy.unbind(cam, disp)
-                disp.close()
-                cam.close_cam()
+                libsrcampy.unbind(self._camera, self._display)
+                self._display.close()
+                self._camera.close_cam()
             except Exception:
                 pass
         else:
             try:
-                self._cap.release()
+                self._camera.release()
             except Exception:
                 pass
-        self._cap = None
+        self._camera = None
+        self._display = None
+        self._use_libsrcampy = False
 
     def start(self) -> None:
         if self._running:
@@ -134,77 +145,106 @@ class TagDetector:
             self._thread.join(timeout=1.0)
         self._close_camera()
 
+    def _read_frame(self):
+        if self._camera is None:
+            return None
+
+        if self._use_libsrcampy:
+            nv12_data = self._camera.get_img(2)
+            if nv12_data is None:
+                return None
+            yuv = np.frombuffer(nv12_data, dtype=np.uint8)
+            height = self.height if yuv.size == int(self.width * self.height * 1.5) else int((yuv.size / 1.5) / self.width)
+            return cv2.cvtColor(yuv.reshape((int(height * 1.5), self.width)), cv2.COLOR_YUV2BGR_NV12)
+
+        success, frame = self._camera.read()
+        if not success or frame is None:
+            return None
+        return frame
+
     def _worker(self) -> None:
         while self._running:
-            frame = None
             try:
-                if self._cap is None:
-                    time.sleep(0.1)
+                frame = self._read_frame()
+                if frame is None:
+                    time.sleep(0.01)
                     continue
 
-                if self._use_libsrc:
-                    cam, _ = self._cap
-                    nv12 = cam.get_img(2)
-                    if nv12 is None:
-                        time.sleep(0.005)
-                        continue
-                    yuv = np.frombuffer(nv12, dtype=np.uint8)
-                    h = self.height if yuv.size == int(self.width * self.height * 1.5) else int((yuv.size / 1.5) / self.width)
-                    frame = cv2.cvtColor(yuv.reshape((int(h * 1.5), self.width)), cv2.COLOR_YUV2BGR_NV12)
-                else:
-                    cap = self._cap
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        time.sleep(0.02)
-                        continue
+                corners, ids, _ = self.detector.detectMarkers(frame)
+                detected_tags: list[dict] = []
 
-                corners, ids, _ = self._detector.detectMarkers(frame)
-                detected = []
-                if ids is not None and len(ids) > 0:
-                    for i in range(len(ids)):
-                        try:
-                            # solvePnP expects object points (4,3) and image points (4,2)
-                            img_pts = corners[i][0].astype(np.float32)
-                            success, rvec, tvec = cv2.solvePnP(self._obj_points, img_pts, self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
-                            if not success:
-                                continue
-                            tag = {
-                                "id": int(ids[i][0]),
-                                "rvec": [float(x) for x in rvec.flatten().tolist()],
-                                "tvec": [float(x) for x in tvec.flatten().tolist()],
+                if ids is not None:
+                    for index in range(len(ids)):
+                        success, rvec, tvec = cv2.solvePnP(
+                            self._obj_points,
+                            corners[index][0],
+                            self.camera_matrix,
+                            self.dist_coeffs,
+                            flags=cv2.SOLVEPNP_ITERATIVE,
+                        )
+                        if not success:
+                            continue
+                        detected_tags.append(
+                            {
+                                "id": int(ids[index][0]),
+                                "rvec": [float(value) for value in rvec.flatten().tolist()],
+                                "tvec": [float(value) for value in tvec.flatten().tolist()],
                                 "x": float(tvec[0][0]),
                                 "y": float(tvec[1][0]),
                                 "z": float(tvec[2][0]),
                             }
-                            detected.append(tag)
-                        except Exception:
-                            continue
+                        )
+
+                best_tag = self._select_best_tag(detected_tags)
+                latest_pose = {
+                    "detected": best_tag is not None,
+                    "id": int(best_tag["id"]) if best_tag else None,
+                    "x": float(best_tag["x"]) if best_tag else 0.0,
+                    "z": float(best_tag["z"]) if best_tag else 0.0,
+                    "updated_at": time.time(),
+                }
 
                 with self._lock:
-                    self._latest = detected
-
+                    self._latest_tags = detected_tags
+                    self._latest_pose = latest_pose
             except Exception:
                 time.sleep(0.05)
 
-        # worker exiting
+    @staticmethod
+    def _select_best_tag(tags: list[dict]) -> dict | None:
+        if not tags:
+            return None
+        return min(tags, key=lambda tag: float(tag.get("x", 0.0)) ** 2 + float(tag.get("z", 0.0)) ** 2)
 
-    def get_latest_tags(self) -> List[Dict]:
+    def get_latest_tags(self) -> list[dict]:
         with self._lock:
-            return json.loads(json.dumps(self._latest))
+            return json.loads(json.dumps(self._latest_tags))
+
+    def get_best_tag(self) -> dict | None:
+        tags = self.get_latest_tags()
+        return self._select_best_tag(tags)
+
+    def get_latest_pose(self) -> dict[str, float]:
+        with self._lock:
+            return json.loads(json.dumps(self._latest_pose))
+
+    def legacy_pose(self) -> dict[str, float]:
+        """既存の zidou 系が読む 1 件分の tag_pose 形式を返す。"""
+        return self.get_latest_pose()
 
     def write_pose_file(self, path: Path | str) -> None:
         path = Path(path)
-        payload = {"detected": bool(self.get_latest_tags()), "tags": self.get_latest_tags(), "updated_at": time.time()}
+        payload = self.legacy_pose()
         try:
             path.write_text(json.dumps(payload), encoding="utf-8")
-        except Exception:
+        except OSError:
             pass
 
     def iter_tag_events(self, poll_interval: float = 0.1):
-        """ジェネレータ: 定期的に最新タグリストを返す（Ctrl-C まで）"""
+        """定期的に最新タグ一覧を返すジェネレータ。"""
         try:
             while True:
-                yield {"time": time.time(), "tags": self.get_latest_tags()}
+                yield {"time": time.time(), "tags": self.get_latest_tags(), "pose": self.get_latest_pose()}
                 time.sleep(poll_interval)
         except GeneratorExit:
             return

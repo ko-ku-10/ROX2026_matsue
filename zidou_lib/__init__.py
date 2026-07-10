@@ -1,18 +1,15 @@
 """zidou_lib
-軽量なタグ検出器とメカナム足回りユーティリティを提供するライブラリ。
-
-使い方の例:
-from zidou_lib.tag_detector import TagDetector
-from zidou_lib.drivetrain import mecanum_ik
-
-det = TagDetector()
-det.start()
-time.sleep(1.0)
-print(det.get_latest_tags())
-det.stop()
+AprilTag 読み取りとメカナム制御の分離済みライブラリ。
 """
 
 from .tag_detector import TagDetector
-from .drivetrain import mecanum_ik, blend_commands
+from .drivetrain import AutoNavigator, best_tag_from_list, blend_commands, mecanum_ik, read_latest_tag_pose
 
-__all__ = ["TagDetector", "mecanum_ik", "blend_commands"]
+__all__ = [
+    "TagDetector",
+    "AutoNavigator",
+    "best_tag_from_list",
+    "blend_commands",
+    "mecanum_ik",
+    "read_latest_tag_pose",
+]
