@@ -1,0 +1,14 @@
+[project]
+name = "honsen-rox"
+version = "0.1.0"
+description = "HONSEN ROX robot control scaffold"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "evdev>=1.7.1",
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+honsen-run-all = "run_all:main"

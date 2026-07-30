@@ -2,6 +2,7 @@ from evdev import InputDevice, ecodes, list_devices
 from pathlib import Path
 import Hobot.GPIO as GPIO
 
+
 # コントローラーのイベントデバイス
 # /dev/input/eventX は環境によって変わるため、自動検出します。
 
@@ -46,14 +47,14 @@ def find_gamepad():
 
 gamepad = find_gamepad()
 
-# 電磁弁を接続したGPIO
-VALVE_PIN = 27
+# toyota.py と同じ設定: BOARD番号の12番ピン
+VALVE_PIN = 12
 
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(VALVE_PIN, GPIO.OUT)
-GPIO.output(VALVE_PIN, GPIO.LOW)
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(VALVE_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 print(f'使用するゲームパッド: {gamepad.path} ({gamepad.name})')
+print(f'GPIO設定: BOARD / pin {VALVE_PIN}')
 print('待機中... ○ボタンは BTN_SOUTH / BTN_EAST のどちらかです')
 
 try:

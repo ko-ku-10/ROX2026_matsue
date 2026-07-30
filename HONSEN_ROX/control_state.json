@@ -1,0 +1,80 @@
+{
+  "updated_at": 1785372038.3459146,
+  "field": {
+    "width_m": 6.0,
+    "height_m": 4.0,
+    "home": {
+      "x": 0.4,
+      "y": 0.55,
+      "theta": 0.0
+    },
+    "search": {
+      "x": 1.2,
+      "y": 1.2,
+      "theta": 0.0
+    },
+    "ball_approach": {
+      "x": 1.8,
+      "y": 1.05,
+      "theta": 0.0
+    },
+    "goal": {
+      "x": 4.75,
+      "y": 0.55,
+      "theta": 0.0
+    },
+    "tag_standoff": {
+      "x": 0.9,
+      "y": 0.55,
+      "theta": 0.0
+    },
+    "apriltag_targets": {
+      "1": {
+        "x": 0.9,
+        "y": 0.55,
+        "theta": 0.0
+      },
+      "2": {
+        "x": 2.2,
+        "y": 0.55,
+        "theta": 0.0
+      },
+      "3": {
+        "x": 3.5,
+        "y": 0.55,
+        "theta": 0.0
+      },
+      "4": {
+        "x": 4.8,
+        "y": 0.55,
+        "theta": 0.0
+      }
+    }
+  },
+  "sensors": {
+    "tag_pose": null,
+    "ball_pose": null
+  },
+  "selection": {
+    "mode": "idle",
+    "name": "search",
+    "target": {
+      "x": 1.2,
+      "y": 1.2,
+      "theta": 0.0
+    },
+    "source": "default"
+  },
+  "hardware": {
+    "serial_port": "/dev/ttyUSB0",
+    "serial_baud": 921600,
+    "motor_ids": {
+      "FL": 12,
+      "FR": 20,
+      "RL": 28,
+      "RR": 36
+    },
+    "solenoid_pin": 12,
+    "solenoid_gpio_mode": "BOARD"
+  }
+}
